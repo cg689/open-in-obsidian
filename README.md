@@ -2,6 +2,8 @@
 
 > 双击任意 `.md` 文件，Obsidian 直接打开**这个文件本身**——不弹窗、不闪黑框、不用重启。
 
+**简体中文** | [English](README_EN.md)
+
 [![Windows](https://img.shields.io/badge/platform-Windows-blue)]() [![No dependencies](https://img.shields.io/badge/dependencies-none-green)]() [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 如果你在 Windows 上用 Obsidian，大概率遇到过下面这两个让人抓狂的问题：
@@ -103,24 +105,14 @@ open-in-obsidian/
 │   ├── install.ps1          # 一键安装
 │   └── uninstall.ps1        # 一键卸载
 ├── LICENSE
-└── README.md
+├── README.md                # 中文文档
+└── README_EN.md             # English docs
 ```
 
 ## 许可证
 
 [MIT](LICENSE) —— 随便用，欢迎 PR 和 issue。
 
----
+## 其他语言
 
-## English summary
-
-Double-clicking a `.md` file in Windows only *launches* Obsidian, which restores the last workspace and **ignores the file you clicked** — a known Obsidian design limitation. This project fixes it by registering a file association that forwards the clicked path to Obsidian via the official `obsidian://open?path=...` URI, using a tiny **windowless GUI helper compiled on-the-fly** from ~50 lines of C# (no PowerShell console flash, no wscript LOLBin blocks, no downloads, no admin rights, changes take effect immediately).
-
-```powershell
-# install
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
-# uninstall
-powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
-```
-
-Limitation: the file must live inside an Obsidian vault (that's an upstream URI protocol constraint).
+- [English README](README_EN.md)
