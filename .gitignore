@@ -1,0 +1,10 @@
+# compiled helper output (built by scripts/install.ps1)
+bin/
+*.exe
+
+# user backups created by installer
+previous-md-default.txt
+
+# OS junk
+Thumbs.db
+.DS_Store
