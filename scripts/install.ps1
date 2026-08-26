@@ -194,5 +194,8 @@ Write-Host ""
 Write-Host "Done. Try double-clicking a .md file inside one of your Obsidian vaults." -ForegroundColor Green
 if ($userChoiceNote) { Write-Host "Note: $userChoiceNote" -ForegroundColor Yellow }
 Write-Host ""
+Write-Host "Vault-external .md files will fall back to Typora / VS Code / Notepad."
+Write-Host "To pin a specific editor for those, put its full exe path in: $InstallDir\fallback-editor.txt"
+Write-Host ""
 Write-Host "Previous .md default backed up to: $backupFile"
 Write-Host "To undo everything: powershell -ExecutionPolicy Bypass -File .\uninstall.ps1"

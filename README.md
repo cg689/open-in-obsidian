@@ -28,18 +28,21 @@ Windows 文件关联（Obsidian.md ProgId）
      │
      ▼
 OpenInObsidian.exe   ← GUI 子系统程序，天生无控制台窗口，零闪烁
-     │  URL 编码文件路径
-     ▼
-obsidian://open?path=E%3A%5C%E6%96%87%E6%A1%A3%5Clinux%E5%91%BD%E4%BB%A4.md
+     │  读取 %APPDATA%\obsidian\obsidian.json，判断文件在不在某个 vault 内
      │
-     ▼
-Obsidian 打开并跳转到该文件 ✅
+     ├─ 在 vault 内 → URL 编码路径，派发官方协议
+     │     obsidian://open?path=E%3A%5C%E6%96%87%E6%A1%A3%5Clinux%E5%91%BD%E4%BB%A4.md
+     │     → Obsidian 打开并跳转到该文件 ✅
+     │
+     └─ 在 vault 外 → 自动回落到本地编辑器打开 ✅
+           （fallback-editor.txt 指定的程序 → Typora → VS Code → 记事本）
 ```
 
 ### 特点
 
-- **零依赖**：不需要下载任何东西，用 Windows 自带的 .NET Framework 编译器现场编译一个约 50 行的转发程序——源码就在 `src/`，装的是什么一目了然
+- **零依赖**：不需要下载任何东西，用 Windows 自带的 .NET Framework 编译器现场编译一个小巧的转发程序（约 200 行源码，含 vault 检测与回落逻辑）——源码就在 `src/`，装的是什么一目了然
 - **零弹窗**：`/target:winexe` 编译的 GUI 程序，没有控制台窗口，什么都不闪
+- **vault 外文件自动回落**：双击不在任何 vault 里的 `.md`（比如随手下载的），会自动改用 Typora / VS Code / 记事本打开——因为 Obsidian 官方协议打不开 vault 外文件（可在 `fallback-editor.txt` 自定义，见常见问题）
 - **即时生效**：安装后调用 `SHChangeNotify` 通知 Explorer，**无需重启/注销**
 - **仅改当前用户注册表（HKCU）**：不要管理员权限，卸载脚本一键还原
 
@@ -60,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 3. 注册文件关联并设为 `.md` 默认打开方式
 4. 通知 Explorer 立即生效
 
-装完双击一个 vault 里的 `.md` 试试。
+装完双击一个 vault 里的 `.md` 试试。vault 外的 `.md` 会自动回落到 Typora / VS Code / 记事本打开；想指定其他编辑器，把它的完整路径写进 `%LOCALAPPDATA%\OpenInObsidian\fallback-editor.txt`（一行）即可。
 
 > **如果双击还是打开别的程序**：说明你之前给 `.md` 设置过的默认应用（受 Windows ACL 保护的 UserChoice 键）优先级更高。右键任意 `.md` → 打开方式 → 选择其他应用 → 选 **Markdown File (Obsidian)** 并勾选「始终使用此应用」，一次即可。
 
@@ -74,9 +77,25 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 
 ## 已知限制
 
-- **只能打开 vault（仓库）内的文件**。`obsidian://open?path=` 是 Obsidian 官方协议的硬限制：文件必须属于某个已添加的 vault，孤立的 `.md`（比如随手下载的）无法打开。如果你经常处理 vault 外的 md，建议搭配 Typora / VS Code 使用
+- **vault 外文件不能用 Obsidian 本体编辑**。`obsidian://open?path=` 是 Obsidian 官方协议的硬限制。本项目对此做了兜底：vault 外的 `.md` 会自动改用回落编辑器打开（`fallback-editor.txt` 指定的程序，否则 Typora → VS Code → 记事本）。如果你想把整个磁盘目录都纳入 Obsidian，也可以直接把目录添加为 vault。想用 Obsidian 编辑任意孤立文件，可以看下面替代方案里 ObsidianShell 的 VaultRecent 模式
 - 双击后 Obsidian 不会自动最小化到后台再跳出来——它会把窗口带到前台并打开文件，这属于 Obsidian 自身行为
 - 仅支持 Windows（macOS / Linux 的文件关联机制完全不同）
+
+## 替代方案
+
+这个项目不是第一个解决该问题的工具，按需求选合适的就好：
+
+| | 本项目 (open-in-obsidian) | [ObsidianShell](https://github.com/Chaoses-Ib/ObsidianShell) |
+|---|---|---|
+| 安装 | 一条命令，现场用系统编译器编译 | 下载预编译安装包 |
+| 仓库内容 | 纯源码，无任何二进制 | 预编译 exe |
+| vault 外文件 | 回落到 Typora / VS Code / 记事本 | VaultRecent 模式可直接用 Obsidian 编辑 |
+| 零弹窗 | ✅ | ✅ |
+| 功能面 | 极简，只解决「双击打开这个文件」 | 丰富：CLI、右键菜单、启动器工作流等 |
+
+- **[ObsidianShell](https://github.com/Chaoses-Ib/ObsidianShell)**：功能更全的同类工具。它的 VaultRecent/Recent 模式通过目录联接（junction）把任意孤立文件临时挂进一个「Recent vault」，从而直接用 Obsidian 编辑 vault 外文件——这一点比本项目的「回落到别的编辑器」更彻底。适合想把 Obsidian 当万能 Markdown 编辑器的重度用户
+- **手动 PowerShell / VBS 脚本**：不用装任何东西，但每次双击会闪控制台黑框，wscript 方案还常被安全策略当 LOLBin 拦截
+- **换一个编辑器做 .md 默认程序**（Typora / VS Code）：如果你不强依赖 Obsidian，这永远是最简单的方案
 
 ## 常见问题
 
@@ -87,7 +106,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 `wscript.exe` 被很多安全策略标记为 LOLBin（ living-off-the-land 攻击常用程序），企业环境里经常被直接拦截，不如编译出来的普通 exe 干净。
 
 **Q：这个 exe 会不会偷偷干别的？**
-源码只有 50 行，就在 `src/OpenInObsidian.cs`：读路径 → URL 编码 → 派发 URI，catch 里什么都不做。安装脚本没有下载任何东西，用的是系统自带编译器，全程可审计。
+源码只有一个文件 `src/OpenInObsidian.cs`：读路径 → 读 vault 列表判断归属 → 派发 URI 或调用回落编辑器，catch 里什么都不做。安装脚本没有下载任何东西，用的是系统自带编译器，全程可审计。
+
+**Q：vault 外的 `.md` 双击后会怎样？**
+Obsidian 官方协议打不开 vault 外文件，所以这类文件会自动改用回落编辑器打开：优先用 `%LOCALAPPDATA%\OpenInObsidian\fallback-editor.txt` 里指定的程序（一行，编辑器 exe 的完整路径），否则依次寻找 Typora → VS Code，都没有就退到记事本。删掉该文件则恢复自动检测。
 
 **Q：`.md` 图标会变吗？**
 会沿用 Obsidian 的图标（注册时把 `DefaultIcon` 指向了 Obsidian.exe）。

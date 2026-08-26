@@ -28,18 +28,21 @@ Windows file association (Obsidian.md ProgId)
      │
      ▼
 OpenInObsidian.exe   ← GUI-subsystem program: no console window by design, zero flicker
-     │  URL-encode the file path
-     ▼
-obsidian://open?path=C%3A%5CNotes%5Cmeeting-notes.md
+     │  reads %APPDATA%\obsidian\obsidian.json to check whether the file is in a vault
      │
-     ▼
-Obsidian opens and jumps to that file ✅
+     ├─ inside a vault → URL-encode the path, dispatch the official protocol
+     │     obsidian://open?path=C%3A%5CNotes%5Cmeeting-notes.md
+     │     → Obsidian opens and jumps to that file ✅
+     │
+     └─ outside a vault → open with a fallback editor instead ✅
+           (program from fallback-editor.txt → Typora → VS Code → Notepad)
 ```
 
 ### Highlights
 
-- **Zero dependencies**: nothing to download. The installer compiles a ~50-line forwarder using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
+- **Zero dependencies**: nothing to download. The installer compiles a small forwarder (~200 lines, vault detection and fallback included) using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
 - **Zero popups**: compiled with `/target:winexe`, a GUI-subsystem program with no console window at all — nothing ever flashes
+- **Fallback for vault-external files**: double-clicking a `.md` that lives outside any vault (e.g. a random download) automatically opens it in Typora / VS Code / Notepad instead — because Obsidian's official protocol cannot open files outside a vault (customizable via `fallback-editor.txt`, see FAQ)
 - **Instant effect**: the installer calls `SHChangeNotify` to notify Explorer — **no reboot / logoff needed**
 - **Per-user registry only (HKCU)**: no admin rights required; the uninstall script restores everything in one command
 
@@ -60,7 +63,7 @@ The script automatically:
 3. Registers the file association and sets it as the default for `.md`
 4. Notifies Explorer so it takes effect immediately
 
-After installing, double-click a `.md` file inside one of your vaults to try it out.
+After installing, double-click a `.md` file inside one of your vaults to try it out. A `.md` outside any vault automatically falls back to Typora / VS Code / Notepad; to pin a specific editor, put its full exe path on a single line in `%LOCALAPPDATA%\OpenInObsidian\fallback-editor.txt`.
 
 > **If double-clicking still opens another app**: a default app you set previously for `.md` (stored in the UserChoice key, which is protected by a Windows ACL) takes precedence. Right-click any `.md` → Open with → Choose another app → pick **Markdown File (Obsidian)** and check "Always use this app" — once is enough.
 
@@ -74,9 +77,25 @@ This removes the file association, restores your previous `.md` default (automat
 
 ## Known Limitations
 
-- **Only files inside a vault can be opened.** `obsidian://open?path=` is a hard constraint of Obsidian's official protocol: the file must belong to an existing vault. Standalone `.md` files (e.g. random downloads) won't open. If you often work with md files outside vaults, pair this with Typora / VS Code
+- **Files outside a vault cannot be edited in Obsidian itself.** This is a hard constraint of `obsidian://open?path=`. This project works around it: vault-external `.md` files are automatically opened in a fallback editor (the program from `fallback-editor.txt`, otherwise Typora → VS Code → Notepad). If you want an entire folder inside Obsidian, simply add it as a vault. To edit truly standalone files in Obsidian, see ObsidianShell's VaultRecent mode under Alternatives
 - Obsidian won't minimize to the background and pop back — it brings its window to the front and opens the file; that's Obsidian's own behavior
 - Windows only (file-association mechanisms on macOS / Linux are completely different)
+
+## Alternatives
+
+This project isn't the first tool to solve this problem — pick whatever fits your needs:
+
+| | This project (open-in-obsidian) | [ObsidianShell](https://github.com/Chaoses-Ib/ObsidianShell) |
+|---|---|---|
+| Install | One command, compiled on the fly by the system compiler | Download a prebuilt installer |
+| Repo contents | Pure source, no binaries | Prebuilt exe |
+| Vault-external files | Falls back to Typora / VS Code / Notepad | VaultRecent mode edits them inside Obsidian |
+| No popups | ✅ | ✅ |
+| Feature scope | Minimal: just "double-click opens *this* file" | Rich: CLI, context menu, launcher workflows, … |
+
+- **[ObsidianShell](https://github.com/Chaoses-Ib/ObsidianShell)**: the feature-complete take on this problem. Its VaultRecent/Recent mode uses directory junctions to temporarily mount standalone files into a "Recent vault", letting Obsidian itself edit vault-external files — more thorough than this project's "fall back to another editor". Great for power users who want Obsidian as a universal Markdown editor
+- **Hand-rolled PowerShell / VBS scripts**: nothing to install, but every double-click flashes a console window, and wscript-based ones are often blocked as LOLBins by security policies
+- **Just use another editor (Typora / VS Code) as the .md default**: if you don't deeply depend on Obsidian, this is always the simplest solution
 
 ## FAQ
 
@@ -87,7 +106,10 @@ You could, but every double-click would flash a black console window (even `-Win
 `wscript.exe` is flagged as a LOLBin (a binary commonly abused in living-off-the-land attacks) by many security policies and is often blocked outright in corporate environments. A plain compiled exe is much cleaner.
 
 **Q: Could this exe secretly do something else?**
-The source is only 50 lines, in `src/OpenInObsidian.cs`: read the path → URL-encode it → dispatch the URI, with an empty catch block. The install script downloads nothing and uses the system's built-in compiler — fully auditable end to end.
+The source is a single file, `src/OpenInObsidian.cs`: read the path → read the vault list to decide where it belongs → dispatch the URI or launch the fallback editor, with an empty catch block. The install script downloads nothing and uses the system's built-in compiler — fully auditable end to end.
+
+**Q: What happens when I double-click a `.md` outside any vault?**
+Obsidian's official protocol can't open vault-external files, so they are automatically opened in a fallback editor: the program specified in `%LOCALAPPDATA%\OpenInObsidian\fallback-editor.txt` (one line: full path to the editor exe) if present, otherwise Typora → VS Code, and Notepad as the last resort. Delete the file to go back to auto-detection.
 
 **Q: Will the `.md` icon change?**
 It uses Obsidian's icon (the registration points `DefaultIcon` at Obsidian.exe).
@@ -105,7 +127,8 @@ open-in-obsidian/
 │   ├── install.ps1          # one-command install
 │   └── uninstall.ps1        # one-command uninstall
 ├── LICENSE
-└── README.md
+├── README.md                # Chinese docs
+└── README_EN.md             # English docs
 ```
 
 ## License
