@@ -111,6 +111,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 **Q：vault 外的 `.md` 双击后会怎样？**
 Obsidian 官方协议打不开 vault 外文件，所以这类文件会自动改用回落编辑器打开：优先用 `%LOCALAPPDATA%\OpenInObsidian\fallback-editor.txt` 里指定的程序（一行，编辑器 exe 的完整路径），否则依次寻找 Typora → VS Code，都没有就退到记事本。删掉该文件则恢复自动检测。
 
+**Q：Obsidian 弹出加载仓库失败的报错（EINVAL），提到 `System Volume Information`？**
+别把整个磁盘根目录（如 `E:\`）添加为 vault。Obsidian 加载仓库时要扫描根目录，撞上系统保护文件夹（隐藏 + 拒绝访问）就扫描失败，整个仓库都打不开。解决：移除整盘 vault，只把具体目录（如 `E:\文档`）加为仓库；根目录下零散的 `.md` 交给本项目的回落编辑器处理即可。
+
 **Q：`.md` 图标会变吗？**
 会沿用 Obsidian 的图标（注册时把 `DefaultIcon` 指向了 Obsidian.exe）。
 

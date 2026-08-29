@@ -111,6 +111,9 @@ The source is a single file, `src/OpenInObsidian.cs`: read the path → read the
 **Q: What happens when I double-click a `.md` outside any vault?**
 Obsidian's official protocol can't open vault-external files, so they are automatically opened in a fallback editor: the program specified in `%LOCALAPPDATA%\OpenInObsidian\fallback-editor.txt` (one line: full path to the editor exe) if present, otherwise Typora → VS Code, and Notepad as the last resort. Delete the file to go back to auto-detection.
 
+**Q: Obsidian fails to load a vault (EINVAL) and the error mentions `System Volume Information`?**
+Don't add an entire drive root (e.g. `E:\`) as a vault. When loading a vault Obsidian scans its root directory and chokes on Windows system-protected folders (hidden + access denied), which fails the whole vault load. Fix: remove the drive-root vault and add specific folders (e.g. `E:\Docs`) instead; loose `.md` files at the drive root will be handled by this project's fallback editor.
+
 **Q: Will the `.md` icon change?**
 It uses Obsidian's icon (the registration points `DefaultIcon` at Obsidian.exe).
 
