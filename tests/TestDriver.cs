@@ -26,9 +26,9 @@ internal static class TestDriver
             Console.WriteLine("  [FAIL] OpenInObsidian.Program not found in assembly");
             return 1;
         }
-        MethodInfo getVaults = t.GetMethod("GetVaultPaths", BindingFlags.NonPublic | BindingFlags.Static);
-        MethodInfo getCustom = t.GetMethod("GetCustomFallbackEditor", BindingFlags.NonPublic | BindingFlags.Static);
-        MethodInfo logError = t.GetMethod("LogError", BindingFlags.NonPublic | BindingFlags.Static);
+        MethodInfo getVaults = RequireMethod(t, "GetVaultPaths");
+        MethodInfo getCustom = RequireMethod(t, "GetCustomFallbackEditor");
+        MethodInfo logError = RequireMethod(t, "LogError");
 
         // Redirect the config-path seam to our fixture (env-var APPDATA changes
         // do NOT work: GetFolderPath resolves CSIDL_APPDATA from the registry).
@@ -53,6 +53,15 @@ internal static class TestDriver
             !@"E:\study2\note.md".StartsWith("E:\\st\\", StringComparison.OrdinalIgnoreCase));
         Check("E:\\st\\a.md DOES match",
             @"E:\st\a.md".StartsWith("E:\\st\\", StringComparison.OrdinalIgnoreCase));
+
+        // --- 2b. nested vaults: most specific (longest) root comes first ---
+        WriteObsidianJson("{\"vaults\":{\"root\":{\"path\":\"E:\\\\\"},\"docs\":{\"path\":\"E:\\\\docs\"}}}");
+        vaults = (List<string>)getVaults.Invoke(null, null);
+        Check("nested vaults sorted longest first",
+            vaults != null && vaults.Count == 2 && vaults[0] == "E:\\docs\\" && vaults[1] == "E:\\");
+        Check("file in E:\\docs\\ claimed by E:\\docs\\ (not E:\\)",
+            vaults != null && vaults.Count > 0
+                && @"E:\docs\a.md".StartsWith(vaults[0], StringComparison.OrdinalIgnoreCase));
 
         // --- 3. malformed JSON -> null (caller keeps dispatching to Obsidian) ---
         WriteObsidianJson("{ this is not json");
@@ -96,6 +105,22 @@ internal static class TestDriver
         string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appdata", "obsidian");
         Directory.CreateDirectory(dir);
         File.WriteAllText(Path.Combine(dir, "obsidian.json"), json);
+    }
+
+    /// <summary>
+    /// Look up a private static method and fail loudly (instead of a later
+    /// NullReferenceException) when it was renamed or removed.
+    /// </summary>
+    private static MethodInfo RequireMethod(Type t, string name)
+    {
+        MethodInfo m = t.GetMethod(name, BindingFlags.NonPublic | BindingFlags.Static);
+        if (m == null)
+        {
+            Console.WriteLine("  [FAIL] method '" + name + "' not found in OpenInObsidian.Program" +
+                " (renamed or removed? update TestDriver.cs)");
+            Environment.Exit(1);
+        }
+        return m;
     }
 
     private static void Check(string name, bool ok)

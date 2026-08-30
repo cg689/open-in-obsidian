@@ -39,8 +39,9 @@ namespace OpenInObsidian
         /// Seam for unit tests: where to read Obsidian's config from. Tests
         /// replace this to point GetVaultPaths at a fixture file; production
         /// always uses the default (APPDATA\obsidian\obsidian.json).
+        /// Private is fine: the test driver reaches it via reflection.
         /// </summary>
-        internal static Func<string> ObsidianConfigPath = delegate
+        private static Func<string> ObsidianConfigPath = delegate
         {
             return Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -172,6 +173,11 @@ namespace OpenInObsidian
                         result.Add(vault);
                     }
                 }
+                // Longest path first so nested vaults match the most specific
+                // root: when both "E:\" and "E:\docs" are vaults, a file inside
+                // E:\docs\ must be claimed by E:\docs\ (checked first), not by
+                // the shallower E:\. Main() scans the list in order.
+                result.Sort((a, b) => b.Length.CompareTo(a.Length));
                 return result;
             }
             catch (Exception ex)

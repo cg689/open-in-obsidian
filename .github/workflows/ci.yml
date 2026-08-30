@@ -1,0 +1,22 @@
+# Unit tests on every push / pull request.
+# Uses the same run-tests.ps1 you run locally; windows-latest ships with
+# the .NET Framework compiler (csc.exe) the script looks up, so no extra
+# toolchain or dependencies are needed.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run unit tests
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1

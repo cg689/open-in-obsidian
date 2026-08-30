@@ -40,7 +40,7 @@ OpenInObsidian.exe   ← GUI-subsystem program: no console window by design, zer
 
 ### Highlights
 
-- **Zero dependencies**: nothing to download. The installer compiles a small forwarder (~200 lines, vault detection and fallback included) using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
+- **Zero dependencies**: nothing to download. The installer compiles a small forwarder (~300 lines, vault detection and fallback included) using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
 - **Zero popups**: compiled with `/target:winexe`, a GUI-subsystem program with no console window at all — nothing ever flashes
 - **Fallback for vault-external files**: double-clicking a `.md` that lives outside any vault (e.g. a random download) automatically opens it in Typora / VS Code / Notepad instead — because Obsidian's official protocol cannot open files outside a vault (customizable via `fallback-editor.txt`, see FAQ)
 - **Instant effect**: the installer calls `SHChangeNotify` to notify Explorer — **no reboot / logoff needed**
@@ -134,7 +134,7 @@ open-in-obsidian/
 │   └── uninstall.ps1        # one-command uninstall
 ├── tests/
 │   ├── run-tests.ps1        # one-command test run (compiles into a temp dir, never touches your real config)
-│   └── TestDriver.cs        # 13 unit tests (vault parsing / matching boundaries / fallback config / error log)
+│   └── TestDriver.cs        # 15 unit tests (vault parsing / nested matching / fallback config / error log)
 ├── LICENSE
 ├── README.md                # Chinese docs
 └── README_EN.md             # English docs

@@ -40,7 +40,7 @@ OpenInObsidian.exe   ← GUI 子系统程序，天生无控制台窗口，零闪
 
 ### 特点
 
-- **零依赖**：不需要下载任何东西，用 Windows 自带的 .NET Framework 编译器现场编译一个小巧的转发程序（约 290 行源码，含 vault 检测与回落逻辑）——源码就在 `src/`，装的是什么一目了然
+- **零依赖**：不需要下载任何东西，用 Windows 自带的 .NET Framework 编译器现场编译一个小巧的转发程序（约 300 行源码，含 vault 检测与回落逻辑）——源码就在 `src/`，装的是什么一目了然
 - **零弹窗**：`/target:winexe` 编译的 GUI 程序，没有控制台窗口，什么都不闪
 - **vault 外文件自动回落**：双击不在任何 vault 里的 `.md`（比如随手下载的），会自动改用 Typora / VS Code / 记事本打开——因为 Obsidian 官方协议打不开 vault 外文件（可在 `fallback-editor.txt` 自定义，见常见问题）
 - **即时生效**：安装后调用 `SHChangeNotify` 通知 Explorer，**无需重启/注销**
@@ -133,8 +133,8 @@ open-in-obsidian/
 │   ├── install.ps1          # 一键安装
 │   └── uninstall.ps1        # 一键卸载
 ├── tests/
-│   ├── run-tests.ps1        # 一键跑测试（临时目录编译运行，不碰真实配置）
-│   └── TestDriver.cs        # 13 项单元测试（vault 解析/匹配边界/回落配置/错误日志）
+│   ├── run-tests.ps1        # 一键跑测试（临时目录编译运行，不碰真实配置；csc 定位与 install.ps1 需保持同步）
+│   └── TestDriver.cs        # 15 项单元测试（vault 解析/嵌套匹配/回落配置/错误日志）
 ├── LICENSE
 ├── README.md                # 中文文档
 └── README_EN.md             # English docs

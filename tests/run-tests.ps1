@@ -6,6 +6,10 @@
 # tests\TestDriver.cs into a temporary directory, runs the driver, and
 # exits non-zero when any test fails. The temp directory is removed
 # afterwards; nothing outside it is touched.
+#
+# NOTE: the csc.exe lookup below mirrors the one in scripts\install.ps1.
+# Keep the two in sync — if you change the compiler path here, change it
+# there too (or factor both into a shared helper).
 
 $ErrorActionPreference = 'Stop'
 
