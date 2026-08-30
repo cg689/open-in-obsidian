@@ -106,7 +106,7 @@ if (-not (Test-Path $source)) { throw "Source file not found: $source" }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $helperExe = Join-Path $InstallDir "OpenInObsidian.exe"
 
-& $csc /nologo /target:winexe /optimize+ /out:"$helperExe" "$source"
+& $csc /nologo /target:winexe /optimize+ /r:System.Web.Extensions.dll /out:"$helperExe" "$source"
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $helperExe))
 {
     throw "Compilation failed (csc exit code $LASTEXITCODE)."

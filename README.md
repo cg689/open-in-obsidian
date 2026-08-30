@@ -40,7 +40,7 @@ OpenInObsidian.exe   ← GUI 子系统程序，天生无控制台窗口，零闪
 
 ### 特点
 
-- **零依赖**：不需要下载任何东西，用 Windows 自带的 .NET Framework 编译器现场编译一个小巧的转发程序（约 200 行源码，含 vault 检测与回落逻辑）——源码就在 `src/`，装的是什么一目了然
+- **零依赖**：不需要下载任何东西，用 Windows 自带的 .NET Framework 编译器现场编译一个小巧的转发程序（约 290 行源码，含 vault 检测与回落逻辑）——源码就在 `src/`，装的是什么一目了然
 - **零弹窗**：`/target:winexe` 编译的 GUI 程序，没有控制台窗口，什么都不闪
 - **vault 外文件自动回落**：双击不在任何 vault 里的 `.md`（比如随手下载的），会自动改用 Typora / VS Code / 记事本打开——因为 Obsidian 官方协议打不开 vault 外文件（可在 `fallback-editor.txt` 自定义，见常见问题）
 - **即时生效**：安装后调用 `SHChangeNotify` 通知 Explorer，**无需重启/注销**
@@ -113,6 +113,9 @@ Obsidian 官方协议打不开 vault 外文件，所以这类文件会自动改�
 
 **Q：Obsidian 弹出加载仓库失败的报错（EINVAL），提到 `System Volume Information`？**
 别把整个磁盘根目录（如 `E:\`）添加为 vault。Obsidian 加载仓库时要扫描根目录，撞上系统保护文件夹（隐藏 + 拒绝访问）就扫描失败，整个仓库都打不开。解决：移除整盘 vault，只把具体目录（如 `E:\文档`）加为仓库；根目录下零散的 `.md` 交给本项目的回落编辑器处理即可。
+
+**Q：双击没反应或行为不对，怎么排查？**
+程序自身从不在屏幕上弹任何东西，但会把最近一次内部错误写到 `%LOCALAPPDATA%\OpenInObsidian\last-error.log`（单文件，只保留最后一次）。双击异常时先看这个文件；大部分问题重跑 install.ps1 即可解决。
 
 **Q：`.md` 图标会变吗？**
 会沿用 Obsidian 的图标（注册时把 `DefaultIcon` 指向了 Obsidian.exe）。

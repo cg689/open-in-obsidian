@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
 using Microsoft.Win32;
 
 namespace OpenInObsidian
@@ -78,18 +78,37 @@ namespace OpenInObsidian
                     OpenWithFallback(path);
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // Silent by design: this runs on every double-click and must never
-                // show a window or error dialog. If Obsidian is missing or the
-                // protocol is broken, re-running install.ps1 fixes it.
+                // show a window or error dialog. Details go to last-error.log next
+                // to this exe so failures can still be diagnosed afterwards.
+                LogError("dispatching double-clicked file", ex);
             }
+        }
+
+        /// <summary>
+        /// Append-on-overwrite diagnostic log (single file, last error only).
+        /// Never throws, never shows anything to the user.
+        /// </summary>
+        private static void LogError(string context, Exception ex)
+        {
+            try
+            {
+                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last-error.log");
+                File.WriteAllText(logPath,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " | " + context + " | "
+                    + ex.GetType().Name + ": " + ex.Message + Environment.NewLine
+                    + ex.StackTrace + Environment.NewLine);
+            }
+            catch { }
         }
 
         /// <summary>
         /// Vault roots from Obsidian's own config, each normalized to end with a
         /// trailing separator so "E:\vault" does not match "E:\vault2\...". Returns
-        /// null when the config can't be read.
+        /// null when the config can't be read or parsed (caller then keeps the old
+        /// behaviour and hands the file to Obsidian).
         /// </summary>
         private static List<string> GetVaultPaths()
         {
@@ -100,40 +119,56 @@ namespace OpenInObsidian
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                     "obsidian", "obsidian.json"));
             }
-            catch
+            catch (Exception ex)
             {
+                // Typical when Obsidian is not installed; logged for diagnosis only.
+                LogError("reading obsidian.json", ex);
                 return null;
             }
 
-            List<string> vaults = new List<string>();
-            foreach (Match m in Regex.Matches(json, @"""path""\s*:\s*""((?:[^""\\]|\\.)*)"""))
+            try
             {
-                // Normalize separators: some configurations store forward slashes.
-                string vault = UnescapeJson(m.Groups[1].Value).Replace('/', '\\').TrimEnd('\\') + "\\";
-                if (vault.Length > 1)
+                // Real JSON parsing (JavaScriptSerializer ships with .NET Framework
+                // via System.Web.Extensions.dll). Regex-based extraction was
+                // dropped: it silently broke whenever Obsidian changed its config
+                // layout. Structure: {"vaults": {"<id>": {"path": "...", ...}}}.
+                var root = new JavaScriptSerializer()
+                    .Deserialize<Dictionary<string, object>>(json);
+                object vaultsObj;
+                if (root == null || !root.TryGetValue("vaults", out vaultsObj))
                 {
-                    vaults.Add(vault);
+                    return new List<string>();
                 }
-            }
-            return vaults;
-        }
 
-        private static string UnescapeJson(string s)
-        {
-            return Regex.Replace(s, @"\\(?:u([0-9a-fA-F]{4})|(.))", m =>
+                var result = new List<string>();
+                var vaultMap = vaultsObj as Dictionary<string, object>;
+                if (vaultMap == null)
+                {
+                    return result;
+                }
+                foreach (var entry in vaultMap.Values)
+                {
+                    var info = entry as Dictionary<string, object>;
+                    if (info == null) { continue; }
+                    object pathObj;
+                    if (!info.TryGetValue("path", out pathObj)) { continue; }
+                    string vaultPath = pathObj as string;
+                    if (string.IsNullOrEmpty(vaultPath)) { continue; }
+
+                    // Normalize separators and anchor with a trailing one.
+                    string vault = vaultPath.Replace('/', '\\').TrimEnd('\\') + "\\";
+                    if (vault.Length > 1)
+                    {
+                        result.Add(vault);
+                    }
+                }
+                return result;
+            }
+            catch (Exception ex)
             {
-                if (m.Groups[1].Success)
-                {
-                    return ((char)Convert.ToInt32(m.Groups[1].Value, 16)).ToString();
-                }
-                switch (m.Groups[2].Value)
-                {
-                    case "n": return "\n";
-                    case "r": return "\r";
-                    case "t": return "\t";
-                    default: return m.Groups[2].Value;
-                }
-            });
+                LogError("parsing obsidian.json", ex);
+                return null;
+            }
         }
 
         /// <summary>
@@ -173,11 +208,18 @@ namespace OpenInObsidian
                 string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, FallbackConfigFile);
                 if (File.Exists(cfg))
                 {
-                    string line = File.ReadAllLines(cfg)[0].Trim();
-                    if (line.Length > 0 && File.Exists(line)) { return line; }
+                    string[] lines = File.ReadAllLines(cfg);
+                    if (lines.Length > 0)
+                    {
+                        string line = lines[0].Trim();
+                        if (line.Length > 0 && File.Exists(line)) { return line; }
+                    }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                LogError("reading " + FallbackConfigFile, ex);
+            }
             return null;
         }
 

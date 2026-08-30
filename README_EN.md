@@ -114,6 +114,9 @@ Obsidian's official protocol can't open vault-external files, so they are automa
 **Q: Obsidian fails to load a vault (EINVAL) and the error mentions `System Volume Information`?**
 Don't add an entire drive root (e.g. `E:\`) as a vault. When loading a vault Obsidian scans its root directory and chokes on Windows system-protected folders (hidden + access denied), which fails the whole vault load. Fix: remove the drive-root vault and add specific folders (e.g. `E:\Docs`) instead; loose `.md` files at the drive root will be handled by this project's fallback editor.
 
+**Q: A double-click does nothing or behaves oddly — how do I debug it?**
+The helper never shows anything on screen, but it records the most recent internal error in `%LOCALAPPDATA%\OpenInObsidian\last-error.log` (single file, last error only). Check that file first; most issues are fixed by re-running install.ps1.
+
 **Q: Will the `.md` icon change?**
 It uses Obsidian's icon (the registration points `DefaultIcon` at Obsidian.exe).
 
