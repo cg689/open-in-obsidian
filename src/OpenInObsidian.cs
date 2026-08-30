@@ -35,6 +35,18 @@ namespace OpenInObsidian
     {
         private const string FallbackConfigFile = "fallback-editor.txt";
 
+        /// <summary>
+        /// Seam for unit tests: where to read Obsidian's config from. Tests
+        /// replace this to point GetVaultPaths at a fixture file; production
+        /// always uses the default (APPDATA\obsidian\obsidian.json).
+        /// </summary>
+        internal static Func<string> ObsidianConfigPath = delegate
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "obsidian", "obsidian.json");
+        };
+
         [STAThread]
         private static void Main(string[] args)
         {
@@ -115,9 +127,7 @@ namespace OpenInObsidian
             string json;
             try
             {
-                json = File.ReadAllText(Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "obsidian", "obsidian.json"));
+                json = File.ReadAllText(ObsidianConfigPath());
             }
             catch (Exception ex)
             {

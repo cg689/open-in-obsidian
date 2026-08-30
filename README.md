@@ -132,10 +132,23 @@ open-in-obsidian/
 ├── scripts/
 │   ├── install.ps1          # 一键安装
 │   └── uninstall.ps1        # 一键卸载
+├── tests/
+│   ├── run-tests.ps1        # 一键跑测试（临时目录编译运行，不碰真实配置）
+│   └── TestDriver.cs        # 13 项单元测试（vault 解析/匹配边界/回落配置/错误日志）
 ├── LICENSE
 ├── README.md                # 中文文档
 └── README_EN.md             # English docs
 ```
+
+## 运行测试
+
+改了源码想验证？不用安装，一条命令：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
+```
+
+测试在临时目录编译源码并用反射驱动执行，覆盖 vault 解析（中文路径、正斜杠归一化、前缀重叠边界）、畸形/缺失配置的降级行为、回落编辑器配置读取和错误日志，全程不启动 Obsidian、不碰你真实的 `obsidian.json`。
 
 ## 许可证
 

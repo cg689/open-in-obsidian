@@ -132,10 +132,23 @@ open-in-obsidian/
 ├── scripts/
 │   ├── install.ps1          # one-command install
 │   └── uninstall.ps1        # one-command uninstall
+├── tests/
+│   ├── run-tests.ps1        # one-command test run (compiles into a temp dir, never touches your real config)
+│   └── TestDriver.cs        # 13 unit tests (vault parsing / matching boundaries / fallback config / error log)
 ├── LICENSE
 ├── README.md                # Chinese docs
 └── README_EN.md             # English docs
 ```
+
+## Running the Tests
+
+Want to verify changes to the source? No install needed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
+```
+
+Tests compile the source into a temp directory and drive it via reflection, covering vault parsing (Chinese paths, forward-slash normalization, prefix-overlap boundaries), degraded behavior on malformed / missing configs, fallback-editor.txt reading, and the error log — without launching Obsidian or touching your real `obsidian.json`.
 
 ## License
 
