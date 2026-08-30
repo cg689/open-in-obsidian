@@ -11,7 +11,7 @@
     2. Compiles src\OpenInObsidian.cs into a tiny windowless GUI exe using
        the .NET Framework compiler (csc.exe) that ships with every Windows.
        No downloads, no dependencies, nothing prebuilt - you compile the
-       ~50 lines of source yourself, so you know exactly what runs.
+       source yourself, so you know exactly what runs.
     3. Registers a file association ProgId "Obsidian.md" pointing at that exe.
     4. Makes "Obsidian.md" the default for the .md extension (current-user).
     5. Notifies Explorer so the change takes effect immediately
@@ -72,8 +72,7 @@ function Get-ObsidianPath
         "$env:LOCALAPPDATA\Programs\Obsidian\Obsidian.exe",
         "$env:LOCALAPPDATA\Obsidian\Obsidian.exe",
         "$env:ProgramFiles\Obsidian\Obsidian.exe",
-        "${env:ProgramFiles(x86)}\Obsidian\Obsidian.exe",
-        "D:\Software\obsidian\Obsidian.exe"
+        "${env:ProgramFiles(x86)}\Obsidian\Obsidian.exe"
     ))
     {
         if (Test-Path -LiteralPath $p) { return $p }
@@ -118,13 +117,18 @@ Write-Host "[2/5] Helper compiled : $helperExe"
 # 3. Register the "Obsidian.md" ProgId (per-user)
 # ---------------------------------------------------------------------------
 $progId = "HKCU:\Software\Classes\Obsidian.md"
-$backupFile = Join-Path $InstallDir "previous-md-default.txt"
-
 # Backup the current default for .md before touching anything.
+# Never overwrite an existing backup: on a reinstall the "current" default is
+# our own Obsidian.md, and clobbering the backup would lose the user's true
+# previous default (uninstall would then "restore" Obsidian.md).
+$backupFile = Join-Path $InstallDir "previous-md-default.txt"
 try
 {
     $old = (Get-ItemProperty -Path "HKCU:\Software\Classes\.md" -ErrorAction Stop)."(default)"
-    "HKCU\Software\Classes\.md = $old" | Out-File -FilePath $backupFile -Encoding ASCII
+    if (-not (Test-Path $backupFile) -and $old -ne "Obsidian.md")
+    {
+        "HKCU\Software\Classes\.md = $old" | Out-File -FilePath $backupFile -Encoding ASCII
+    }
 }
 catch { }
 

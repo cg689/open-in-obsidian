@@ -108,7 +108,8 @@ namespace OpenInObsidian
             List<string> vaults = new List<string>();
             foreach (Match m in Regex.Matches(json, @"""path""\s*:\s*""((?:[^""\\]|\\.)*)"""))
             {
-                string vault = UnescapeJson(m.Groups[1].Value).TrimEnd('\\') + "\\";
+                // Normalize separators: some configurations store forward slashes.
+                string vault = UnescapeJson(m.Groups[1].Value).Replace('/', '\\').TrimEnd('\\') + "\\";
                 if (vault.Length > 1)
                 {
                     vaults.Add(vault);
@@ -213,10 +214,17 @@ namespace OpenInObsidian
                 catch { }
             }
 
+            // Standard install locations (user-scope then machine-scope).
+            string localPrograms = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs");
             foreach (string p in new string[]
             {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "Programs", exeName.Replace(".exe", ""), exeName)
+                // VS Code user installer: ...\Programs\Microsoft VS Code\Code.exe
+                Path.Combine(localPrograms, "Microsoft VS Code", exeName),
+                // Typora machine installer
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    exeName.Replace(".exe", ""), exeName),
+                Path.Combine(localPrograms, exeName.Replace(".exe", ""), exeName)
             })
             {
                 if (File.Exists(p)) { return p; }

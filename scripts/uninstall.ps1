@@ -52,8 +52,11 @@ if (Test-Path $mdKey)
             $line = (Get-Content $backupFile -ErrorAction SilentlyContinue | Select-Object -First 1)
             if ($line -match '= (\S.*)$') { $restore = $Matches[1].Trim() }
         }
-        if ($restore)
+        if ($restore -and $restore -ne "Obsidian.md")
         {
+            # A backup containing Obsidian.md itself is a relic of an old
+            # reinstall (pre-fix installers clobbered the backup) - treat it
+            # as no backup rather than "restoring" our own ProgId.
             Set-ItemProperty -Path $mdKey -Name "(default)" -Value $restore
             Write-Host "[2/3] Restored previous .md default: $restore"
         }
