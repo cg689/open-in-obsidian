@@ -4,6 +4,10 @@ bin/
 
 # user backups created by installer
 previous-md-default.txt
+obsidian.json.bak
+
+# local AI-assistant workspace data (notes, memory) - not part of the project
+.workbuddy-ai/
 
 # OS junk
 Thumbs.db

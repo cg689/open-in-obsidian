@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using System.Web.Script.Serialization;
 using Microsoft.Win32;
 
@@ -10,21 +13,37 @@ namespace OpenInObsidian
     /// <summary>
     /// Tiny windowless helper for the "Open in Obsidian" file association.
     ///
-    /// Problem it solves:
-    ///   Obsidian ignores file paths passed on its command line. Double-clicking a
-    ///   .md file only launches Obsidian, which then restores the last workspace
-    ///   (the previously viewed file), not the file you clicked.
+    /// Problems it solves:
+    ///   1. Obsidian ignores file paths passed on its command line, so
+    ///      double-clicking a .md only launches Obsidian, which then restores the
+    ///      last workspace (the previously viewed file) instead of the file you
+    ///      clicked.
+    ///   2. Obsidian's obsidian://open?path= only works for files that live inside
+    ///      a registered vault, so files elsewhere used to be handed to another
+    ///      editor.
     ///
     /// How it works:
-    ///   Windows passes the clicked file path as %1. We check whether the file
-    ///   lives inside one of the user's Obsidian vaults (listed in
-    ///   %APPDATA%\obsidian\obsidian.json):
+    ///   Windows passes the clicked file path as %1. We look it up against the
+    ///   user's Obsidian vaults (listed in %APPDATA%\obsidian\obsidian.json):
+    ///
     ///     - Inside a vault  -> URL-encode the path and dispatch the official URI
     ///                          obsidian://open?path=...  which makes Obsidian open
     ///                          and focus exactly that file.
-    ///     - Outside a vault -> open it with a fallback editor instead, in order:
-    ///                          Typora -> VS Code -> Notepad. (The obsidian://open
-    ///                          protocol only works for files inside a vault.)
+    ///
+    ///     - Outside a vault -> mount it into the "bridge" vault (see below) and
+    ///                          dispatch the same URI with the bridged path. Only if
+    ///                          that is not possible do we hand the file to an
+    ///                          ordinary editor: fallback-editor.txt -> Typora ->
+    ///                          VS Code -> Notepad.
+    ///
+    /// The bridge vault:
+    ///   Obsidian documents that a vault may contain symlinks and junctions that
+    ///   point outside the vault, and it will index and edit the files behind them.
+    ///   So next to this exe we keep a small vault ("vault\") whose entire content
+    ///   is directory junctions pointing at the external folders the user opens
+    ///   files from. A junction puts the file behind a path Obsidian considers part
+    ///   of a vault, which is what makes the protocol work at all. The real files
+    ///   never move, and the user's own vaults are never touched.
     ///
     /// Why an exe instead of powershell/wscript:
     ///   Compiled with /target:winexe (GUI subsystem), so it never flashes a
@@ -34,6 +53,12 @@ namespace OpenInObsidian
     internal static class Program
     {
         private const string FallbackConfigFile = "fallback-editor.txt";
+
+        /// <summary>Folder next to this exe that acts as the bridge vault.</summary>
+        private const string BridgeVaultFolder = "vault";
+
+        /// <summary>MAX_PATH budget; longer bridged paths would fail to open.</summary>
+        private const int MaxPathLength = 259;
 
         /// <summary>
         /// Seam for unit tests: where to read Obsidian's config from. Tests
@@ -83,10 +108,9 @@ namespace OpenInObsidian
 
                 if (inVault)
                 {
-                    string uri = "obsidian://open?path=" + Uri.EscapeDataString(path);
-                    Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true });
+                    Dispatch(path);
                 }
-                else
+                else if (!TryOpenInBridgeVault(path, vaults))
                 {
                     OpenWithFallback(path);
                 }
@@ -98,6 +122,18 @@ namespace OpenInObsidian
                 // to this exe so failures can still be diagnosed afterwards.
                 LogError("dispatching double-clicked file", ex);
             }
+        }
+
+        /// <summary>
+        /// Hands the path to Obsidian's official protocol, which opens and focuses
+        /// exactly that file (or does nothing, if no registered vault contains it).
+        /// </summary>
+        private static void Dispatch(string path)
+        {
+            Process.Start(new ProcessStartInfo("obsidian://open?path=" + Uri.EscapeDataString(path))
+            {
+                UseShellExecute = true
+            });
         }
 
         /// <summary>
@@ -115,6 +151,25 @@ namespace OpenInObsidian
                     + ex.StackTrace + Environment.NewLine);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Records why a vault-external file went to the fallback editor, then tells
+        /// the caller to use it. Without this a "why did it open in Notepad++?"
+        /// report is undebuggable: the helper is windowless by design, so a bare
+        /// "return false" leaves no trace anywhere on the system.
+        /// </summary>
+        private static bool Fallback(string reason)
+        {
+            try
+            {
+                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last-error.log");
+                File.WriteAllText(logPath,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " | fallback | " + reason
+                    + Environment.NewLine);
+            }
+            catch { }
+            return false;
         }
 
         /// <summary>
@@ -187,11 +242,420 @@ namespace OpenInObsidian
             }
         }
 
+        // -----------------------------------------------------------------------
+        // Bridge vault: how vault-external files still reach Obsidian
+        // -----------------------------------------------------------------------
+
         /// <summary>
-        /// Vault-external files can't be opened via obsidian://open, so hand them
-        /// to an ordinary editor. Preference: an optional fallback-editor.txt
-        /// placed next to this exe (first line = editor path), then Typora,
-        /// then VS Code, then Notepad (always present, guaranteed no loop).
+        /// Mounts the file's folder into the bridge vault and dispatches the bridged
+        /// path. Returns false - so the caller falls back to an ordinary editor -
+        /// whenever anything is off: bridge vault missing or not registered with
+        /// Obsidian, folder is a drive root, path too long, or the mount failed.
+        /// Never throws.
+        /// </summary>
+        private static bool TryOpenInBridgeVault(string path, List<string> vaults)
+        {
+            try
+            {
+                string bridge = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, BridgeVaultFolder);
+                string bridgeRoot = bridge.TrimEnd('\\') + "\\";
+
+                // Registration is mandatory: obsidian://open?path= only searches
+                // registered vaults, so an unregistered bridge would silently open
+                // nothing at all - worse than the fallback editor.
+                if (!ContainsVault(vaults, bridgeRoot)) { return Fallback("bridge vault is not registered with Obsidian"); }
+                if (!Directory.Exists(bridge)) { return Fallback("bridge vault folder is missing: " + bridge); }
+
+                string dir = Path.GetDirectoryName(path);
+                if (string.IsNullOrEmpty(dir)) { return Fallback("cannot determine the containing folder"); }
+                dir = dir.TrimEnd('\\');
+                if (dir.Length == 0 || IsDriveRoot(dir))
+                {
+                    return Fallback("file sits directly in a drive root (" + dir + ")");
+                }
+
+                // Obsidian requires junction targets to be disjoint from the vault
+                // root, and silently ignores a link that contains it. Opening a file
+                // in a folder above the bridge vault would need exactly that.
+                if ((dir + "\\").StartsWith(bridgeRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    return Fallback("folder contains the bridge vault: " + dir);
+                }
+
+                List<string> names;
+                List<string> targets;
+                ReadBridgeLinks(bridge, out names, out targets);
+
+                bool mountedNow;
+                string linkPath = SelectLink(bridge, dir, names, targets, out mountedNow);
+                if (linkPath == null) { return Fallback("could not mount " + dir + " into the bridge vault"); }
+
+                string bridged = Path.Combine(linkPath, Path.GetFileName(path));
+                if (bridged.Length > MaxPathLength)
+                {
+                    return Fallback("bridged path would be too long (" + bridged.Length + " characters)");
+                }
+
+                // A freshly created folder is not in Obsidian's index yet, and the
+                // protocol resolves the path against that index. Give the file
+                // watcher a moment, otherwise the very first double-click in a new
+                // folder can look like a no-op.
+                if (mountedNow) { Thread.Sleep(400); }
+
+                Dispatch(bridged);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogError("opening in bridge vault", ex);
+                return false;
+            }
+        }
+
+        private static bool ContainsVault(List<string> vaults, string anchoredPath)
+        {
+            if (vaults == null) { return false; }
+            foreach (string vault in vaults)
+            {
+                if (string.Equals(vault, anchoredPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Junctioning a whole drive root would pull System Volume Information into
+        /// the vault and make Obsidian fail to load it (EINVAL), so those go to the
+        /// fallback editor instead.
+        /// </summary>
+        private static bool IsDriveRoot(string dir)
+        {
+            return dir.Length == 2 && dir[1] == ':';
+        }
+
+        /// <summary>
+        /// Existing junctions in the bridge vault, as parallel name/target lists.
+        /// Real folders someone else put there are left alone.
+        /// </summary>
+        private static void ReadBridgeLinks(string bridge, out List<string> names, out List<string> targets)
+        {
+            names = new List<string>();
+            targets = new List<string>();
+            foreach (string sub in Directory.GetDirectories(bridge))
+            {
+                string name = Path.GetFileName(sub);
+                if (string.Equals(name, ".obsidian", StringComparison.OrdinalIgnoreCase)) { continue; }
+                if ((File.GetAttributes(sub) & FileAttributes.ReparsePoint) == 0) { continue; }
+
+                string target = GetJunctionTarget(sub);
+                if (target == null) { continue; }
+
+                names.Add(name);
+                targets.Add(target.TrimEnd('\\'));
+            }
+        }
+
+        /// <summary>
+        /// Picks the bridge-vault path that should hold the file, creating a
+        /// junction when needed. An existing link is reused whenever the folder is
+        /// the link's target or sits underneath it.
+        ///
+        /// Before adding a link, any link whose target lies *inside* the new folder
+        /// is dropped: Obsidian demands mutually disjoint targets, so the nested
+        /// link would be ignored anyway, and the new link already covers its files.
+        /// </summary>
+        private static string SelectLink(string bridge, string dir, List<string> names,
+            List<string> targets, out bool created)
+        {
+            created = false;
+
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (dir.Equals(targets[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    return Path.Combine(bridge, names[i]);
+                }
+                if (dir.StartsWith(targets[i] + "\\", StringComparison.OrdinalIgnoreCase))
+                {
+                    return Path.Combine(bridge, names[i], dir.Substring(targets[i].Length + 1));
+                }
+            }
+
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (targets[i].StartsWith(dir + "\\", StringComparison.OrdinalIgnoreCase))
+                {
+                    RemoveJunction(Path.Combine(bridge, names[i]));
+                }
+            }
+
+            string link = Path.Combine(bridge, LinkNameFor(dir));
+            if (!CreateJunction(link, dir)) { return null; }
+
+            created = true;
+            return link;
+        }
+
+        /// <summary>
+        /// Junction name inside the bridge vault: the folder's own name for
+        /// readability, plus a hash of the full path so that two folders called
+        /// "docs" on different drives cannot collide.
+        /// </summary>
+        private static string LinkNameFor(string dir)
+        {
+            // Not Path.GetFileName: on .NET Framework that throws on a path
+            // containing invalid characters, and this helper must never throw.
+            string name = LastSegment(dir);
+            if (string.IsNullOrEmpty(name)) { name = dir; }
+
+            var safe = new StringBuilder();
+            foreach (char c in name)
+            {
+                safe.Append(Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c);
+            }
+
+            // A leading dot means "hidden" to Obsidian, which would skip the folder.
+            name = safe.ToString().Trim().TrimStart('.');
+            if (name.Length == 0) { name = "folder"; }
+            if (name.Length > 40) { name = name.Substring(0, 40); }
+
+            return name + " (" + StableHash(dir) + ")";
+        }
+
+        private static string LastSegment(string path)
+        {
+            int i = path.LastIndexOfAny(new char[] { '\\', '/' });
+            return i >= 0 ? path.Substring(i + 1) : path;
+        }
+
+        /// <summary>
+        /// FNV-1a over the upper-cased path. Upper-cased because Windows paths are
+        /// case-insensitive: E:\Docs and E:\docs must not produce two links.
+        /// </summary>
+        private static string StableHash(string text)
+        {
+            ulong hash = 14695981039346656037UL;
+            foreach (char c in text.ToUpperInvariant())
+            {
+                hash ^= c;
+                hash *= 1099511628211UL;
+            }
+            return hash.ToString("x16").Substring(0, 12);
+        }
+
+        // -----------------------------------------------------------------------
+        // Directory junction plumbing
+        //
+        // .NET Framework has no API for junctions (DirectoryInfo.LinkTarget only
+        // arrived in .NET 6), so this talks to the reparse-point APIs directly.
+        // Junctions rather than symlinks because symlinks need
+        // SeCreateSymbolicLinkPrivilege (admin or Developer Mode), while any user
+        // can create a junction.
+        // -----------------------------------------------------------------------
+
+        private const uint GENERIC_READ = 0x80000000;
+        private const uint GENERIC_WRITE = 0x40000000;
+        private const uint FILE_SHARE_READ_WRITE = 0x00000003;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        private const uint FSCTL_SET_REPARSE_POINT = 0x000900A4;
+        private const uint FSCTL_GET_REPARSE_POINT = 0x000900A8;
+        private const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
+
+        /// <summary>tag + data length + reserved + four name offset/length pairs.</summary>
+        private const int ReparseHeaderSize = 16;
+
+        private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+        private static extern IntPtr CreateFileW(string fileName, uint desiredAccess, uint shareMode,
+            IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+        private static extern bool DeviceIoControl(IntPtr device, uint controlCode, IntPtr inBuffer,
+            uint inBufferSize, IntPtr outBuffer, uint outBufferSize, out uint bytesReturned, IntPtr overlapped);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+        private static extern bool RemoveDirectoryW(string pathName);
+
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        /// <summary>
+        /// Records a failed Win32 call. The junction helpers return false / null on
+        /// failure, which is the right behaviour at runtime (the caller falls back),
+        /// but it leaves nothing to diagnose afterwards - so the error code goes to
+        /// last-error.log like any other failure.
+        /// </summary>
+        private static void LogWin32(string context)
+        {
+            LogError(context + " failed", new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()));
+        }
+
+        /// <summary>
+        /// Creates a junction at <paramref name="linkPath"/> pointing at
+        /// <paramref name="targetPath"/>. Returns false (leaving nothing behind)
+        /// when the link path is already taken or the reparse point can't be set.
+        /// </summary>
+        private static bool CreateJunction(string linkPath, string targetPath)
+        {
+            if (Directory.Exists(linkPath) || File.Exists(linkPath)) { return false; }
+
+            bool cleanupNeeded = false;
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                Directory.CreateDirectory(linkPath);
+                cleanupNeeded = true;
+
+                // The reparse buffer carries two copies of the target: the
+                // "substitute" name (\??\C:\dir, what the filesystem resolves) and
+                // the "print" name (C:\dir, what tools display). Windows expects
+                // both, each null-terminated.
+                byte[] substitute = Encoding.Unicode.GetBytes(@"\??\" + targetPath);
+                byte[] print = Encoding.Unicode.GetBytes(targetPath);
+                int pathBufferLength = substitute.Length + 2 + print.Length + 2;
+
+                // The header already carries the four offset/length pairs, so the
+                // buffer is header + path buffer; ReparseDataLength counts the
+                // MOUNT_POINT_REPARSE_BUFFER (those four pairs + the path buffer).
+                int dataLength = 8 + pathBufferLength;
+                byte[] buffer = new byte[ReparseHeaderSize + pathBufferLength];
+                using (var stream = new MemoryStream(buffer))
+                using (var writer = new BinaryWriter(stream))
+                {
+                    writer.Write(IO_REPARSE_TAG_MOUNT_POINT);
+                    writer.Write((ushort)dataLength);
+                    writer.Write((ushort)0);                        // Reserved
+                    writer.Write((ushort)0);                        // SubstituteNameOffset
+                    writer.Write((ushort)substitute.Length);        // SubstituteNameLength
+                    writer.Write((ushort)(substitute.Length + 2));  // PrintNameOffset
+                    writer.Write((ushort)print.Length);             // PrintNameLength
+                    writer.Write(substitute);
+                    writer.Write((ushort)0);
+                    writer.Write(print);
+                    writer.Write((ushort)0);
+                }
+
+                handle = CreateFileW(linkPath, GENERIC_WRITE, FILE_SHARE_READ_WRITE, IntPtr.Zero,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                if (handle == InvalidHandle) { LogWin32("opening " + linkPath); return false; }
+
+                IntPtr pinned = Marshal.AllocHGlobal(buffer.Length);
+                try
+                {
+                    Marshal.Copy(buffer, 0, pinned, buffer.Length);
+                    uint returned;
+                    if (!DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, pinned, (uint)buffer.Length,
+                            IntPtr.Zero, 0, out returned, IntPtr.Zero))
+                    {
+                        LogWin32("setting reparse point on " + linkPath);
+                        return false;
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(pinned);
+                }
+
+                cleanupNeeded = false;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogError("creating junction " + linkPath, ex);
+                return false;
+            }
+            finally
+            {
+                if (handle != IntPtr.Zero && handle != InvalidHandle) { CloseHandle(handle); }
+                if (cleanupNeeded) { RemoveDirectoryW(linkPath); }
+            }
+        }
+
+        /// <summary>
+        /// Target of a junction, or null when the path is not a mount-point
+        /// reparse point (or is one we didn't create - e.g. a volume-GUID link).
+        /// </summary>
+        private static string GetJunctionTarget(string linkPath)
+        {
+            const int bufferSize = 16384;
+            IntPtr handle = IntPtr.Zero;
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                handle = CreateFileW(linkPath, GENERIC_READ, FILE_SHARE_READ_WRITE, IntPtr.Zero,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                if (handle == InvalidHandle) { LogWin32("opening " + linkPath); return null; }
+
+                buffer = Marshal.AllocHGlobal(bufferSize);
+                uint returned;
+                if (!DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, IntPtr.Zero, 0,
+                        buffer, bufferSize, out returned, IntPtr.Zero))
+                {
+                    LogWin32("reading reparse point on " + linkPath);
+                    return null;
+                }
+
+                if ((uint)Marshal.ReadInt32(buffer) != IO_REPARSE_TAG_MOUNT_POINT) { return null; }
+
+                int offset = Marshal.ReadInt16(buffer, 8);
+                int length = Marshal.ReadInt16(buffer, 10);
+                if (length <= 0) { return null; }
+
+                string substitute = Marshal.PtrToStringUni(
+                    new IntPtr(buffer.ToInt64() + ReparseHeaderSize + offset), length / 2);
+                if (substitute == null) { return null; }
+
+                // "\??\C:\dir" (and the \\?\ spelling) -> "C:\dir".
+                if (substitute.StartsWith(@"\??\", StringComparison.Ordinal)
+                    || substitute.StartsWith(@"\\?\", StringComparison.Ordinal))
+                {
+                    return substitute.Substring(4);
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                LogError("reading junction " + linkPath, ex);
+                return null;
+            }
+            finally
+            {
+                if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }
+                if (handle != IntPtr.Zero && handle != InvalidHandle) { CloseHandle(handle); }
+            }
+        }
+
+        /// <summary>
+        /// Deletes the junction itself. RemoveDirectory never descends into the
+        /// target - Directory.Delete(path, recursive: true) WOULD wipe the user's
+        /// real folder, so it must never be used on a bridge-vault entry.
+        /// </summary>
+        private static void RemoveJunction(string linkPath)
+        {
+            try
+            {
+                RemoveDirectoryW(linkPath);
+            }
+            catch (Exception ex)
+            {
+                LogError("removing junction " + linkPath, ex);
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Fallback editor
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Last resort for files we cannot get into Obsidian. Preference: an
+        /// optional fallback-editor.txt placed next to this exe (first line =
+        /// editor path), then Typora, then VS Code, then Notepad (always present,
+        /// guaranteed no loop).
         /// </summary>
         private static void OpenWithFallback(string path)
         {
