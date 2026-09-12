@@ -51,7 +51,7 @@ OpenInObsidian.exe   ← GUI-subsystem program: no console window by design, zer
 
 ### Highlights
 
-- **Zero dependencies**: nothing to download. The installer compiles a forwarder (~740 lines, vault detection, bridge mounting and fallback included) using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
+- **Zero dependencies**: nothing to download. The installer compiles a forwarder (~770 lines, vault detection, bridge mounting and fallback included) using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
 - **Zero popups**: compiled with `/target:winexe`, a GUI-subsystem program with no console window at all — nothing ever flashes
 - **Vault-external files open in Obsidian too**: the file's folder is mounted into a dedicated "bridge" vault as a directory junction, so `.md` files outside every vault open in Obsidian as well — editable and searchable. The real files never move and none of your own vaults are touched (see below)
 - **Falls back when unsure**: when the bridge isn't usable (not registered, file at a drive root, path too long) it opens in Typora / VS Code / Notepad instead — a double-click never just does nothing (customizable via `fallback-editor.txt`, see FAQ)
