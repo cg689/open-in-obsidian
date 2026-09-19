@@ -45,6 +45,13 @@ namespace OpenInObsidian
     ///   of a vault, which is what makes the protocol work at all. The real files
     ///   never move, and the user's own vaults are never touched.
     ///
+    ///   The vault also stays small no matter how many folders get mounted:
+    ///   every run prunes dangling links and links whose target would nest the
+    ///   vault inside itself (mounting an ancestor of the vault makes Obsidian's
+    ///   indexer walk that recursion on every load - observed in the wild as
+    ///   minute-long vault loads), and only the most recently used mounts are
+    ///   kept, because Obsidian indexes every mounted folder in full.
+    ///
     /// Why an exe instead of powershell/wscript:
     ///   Compiled with /target:winexe (GUI subsystem), so it never flashes a
     ///   console window. Script hosts either flash a window (powershell) or get
@@ -56,6 +63,17 @@ namespace OpenInObsidian
 
         /// <summary>Folder next to this exe that acts as the bridge vault.</summary>
         private const string BridgeVaultFolder = "vault";
+
+        /// <summary>Sidecar next to this exe: link name -> last-used ticks.</summary>
+        private const string MountStateFile = "mounts.txt";
+
+        /// <summary>
+        /// Cap on mounted links. Obsidian indexes every mounted folder in full,
+        /// so an unbounded bridge vault would make every vault load slower and
+        /// slower. A static field rather than a const so the test driver can
+        /// lower it via reflection.
+        /// </summary>
+        private static int MaxMountedLinks = 10;
 
         /// <summary>MAX_PATH budget; longer bridged paths would fail to open.</summary>
         private const int MaxPathLength = 259;
@@ -250,8 +268,8 @@ namespace OpenInObsidian
         /// Mounts the file's folder into the bridge vault and dispatches the bridged
         /// path. Returns false - so the caller falls back to an ordinary editor -
         /// whenever anything is off: bridge vault missing or not registered with
-        /// Obsidian, folder is a drive root, path too long, or the mount failed.
-        /// Never throws.
+        /// Obsidian, folder is a drive root, folder overlaps the bridge vault
+        /// itself, path too long, or the mount failed. Never throws.
         /// </summary>
         private static bool TryOpenInBridgeVault(string path, List<string> vaults)
         {
@@ -274,12 +292,15 @@ namespace OpenInObsidian
                     return Fallback("file sits directly in a drive root (" + dir + ")");
                 }
 
-                // Obsidian requires junction targets to be disjoint from the vault
-                // root, and silently ignores a link that contains it. Opening a file
-                // in a folder above the bridge vault would need exactly that.
-                if ((dir + "\\").StartsWith(bridgeRoot, StringComparison.OrdinalIgnoreCase))
+                // Mounting a folder that overlaps the bridge vault - inside it,
+                // the vault itself, or an ancestor of it - would nest the vault
+                // inside its own mount. Seen in the wild: a file directly in
+                // C:\Users mounted the whole profile tree, with the vault under
+                // it, and Obsidian's indexer walked that recursion on every
+                // vault load (minute-long loads, apparent hangs).
+                if (OverlapsBridgeVault(dir, bridgeRoot))
                 {
-                    return Fallback("folder contains the bridge vault: " + dir);
+                    return Fallback("folder overlaps the bridge vault: " + dir);
                 }
 
                 List<string> names;
@@ -290,17 +311,31 @@ namespace OpenInObsidian
                 string linkPath = SelectLink(bridge, dir, names, targets, out mountedNow);
                 if (linkPath == null) { return Fallback("could not mount " + dir + " into the bridge vault"); }
 
+                // Bound the vault's size: Obsidian indexes every mounted folder,
+                // so accumulating one link per folder forever would make every
+                // vault load slower. Track last use and evict the stalest links
+                // beyond the cap - never the one about to be used. Deleting a
+                // junction only removes the link, never the real folder.
+                string linkName = linkPath.Substring(bridgeRoot.Length).Split('\\')[0];
+                if (!names.Contains(linkName)) { names.Add(linkName); }
+                Dictionary<string, long> mounts = LoadMountState();
+                mounts[linkName] = DateTime.UtcNow.Ticks;
+                EvictOverCap(bridge, names, mounts, linkName);
+                SaveMountState(mounts);
+
                 string bridged = Path.Combine(linkPath, Path.GetFileName(path));
                 if (bridged.Length > MaxPathLength)
                 {
                     return Fallback("bridged path would be too long (" + bridged.Length + " characters)");
                 }
 
-                // A freshly created folder is not in Obsidian's index yet, and the
-                // protocol resolves the path against that index. Give the file
-                // watcher a moment, otherwise the very first double-click in a new
-                // folder can look like a no-op.
-                if (mountedNow) { Thread.Sleep(400); }
+                // A freshly created folder is not in the running Obsidian's index
+                // yet, and the protocol resolves paths against that in-memory
+                // index - without a grace period the very first double-click in
+                // a new folder can look like a no-op. Every other case (Obsidian
+                // not running, or another vault active) rescans the disk when it
+                // loads the bridge vault, so waiting would only add latency.
+                if (mountedNow && IsObsidianRunning()) { Thread.Sleep(1200); }
 
                 Dispatch(bridged);
                 return true;
@@ -326,6 +361,37 @@ namespace OpenInObsidian
         }
 
         /// <summary>
+        /// True when mounting <paramref name="dir"/> would make the bridge vault
+        /// contain itself: dir is the bridge, lies inside it, or is one of its
+        /// ancestors. Both directions matter - the old guard only rejected
+        /// folders inside the vault, so a file directly in C:\Users still
+        /// mounted the whole profile tree, with the vault under it.
+        /// </summary>
+        private static bool OverlapsBridgeVault(string dir, string bridgeRoot)
+        {
+            string anchored = dir.TrimEnd('\\') + "\\";
+            return anchored.StartsWith(bridgeRoot, StringComparison.OrdinalIgnoreCase)
+                || bridgeRoot.StartsWith(anchored, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// True when Obsidian.exe is running. Used to decide whether a freshly
+        /// created junction needs a grace period (a running instance learns
+        /// about it only through its file watcher; a cold start rescans anyway).
+        /// </summary>
+        private static bool IsObsidianRunning()
+        {
+            try
+            {
+                return Process.GetProcessesByName("Obsidian").Length > 0;
+            }
+            catch
+            {
+                return true;   // cannot tell -> keep the graceful behaviour
+            }
+        }
+
+        /// <summary>
         /// Junctioning a whole drive root would pull System Volume Information into
         /// the vault and make Obsidian fail to load it (EINVAL), so those go to the
         /// fallback editor instead.
@@ -337,20 +403,50 @@ namespace OpenInObsidian
 
         /// <summary>
         /// Existing junctions in the bridge vault, as parallel name/target lists.
-        /// Real folders someone else put there are left alone.
+        /// Real folders someone else put there are left alone. Also self-heals:
+        /// dangling links (target gone - one of them used to make every later
+        /// open crash into the fallback editor) and links whose target overlaps
+        /// the bridge vault itself are pruned here. Removing a junction never
+        /// touches the folder it pointed at.
         /// </summary>
         private static void ReadBridgeLinks(string bridge, out List<string> names, out List<string> targets)
         {
             names = new List<string>();
             targets = new List<string>();
+            string bridgeRoot = bridge.TrimEnd('\\') + "\\";
             foreach (string sub in Directory.GetDirectories(bridge))
             {
                 string name = Path.GetFileName(sub);
                 if (string.Equals(name, ".obsidian", StringComparison.OrdinalIgnoreCase)) { continue; }
-                if ((File.GetAttributes(sub) & FileAttributes.ReparsePoint) == 0) { continue; }
+
+                // GetAttributes follows the junction and throws on a dangling
+                // one. Fall through to the reparse point itself: if it carries a
+                // target that no longer exists, prune below.
+                FileAttributes attributes = 0;
+                bool attributesKnown = true;
+                try
+                {
+                    attributes = File.GetAttributes(sub);
+                }
+                catch
+                {
+                    attributesKnown = false;
+                }
+                if (attributesKnown && (attributes & FileAttributes.ReparsePoint) == 0) { continue; }
 
                 string target = GetJunctionTarget(sub);
                 if (target == null) { continue; }
+
+                if (!Directory.Exists(target))
+                {
+                    RemoveJunction(sub);
+                    continue;
+                }
+                if (OverlapsBridgeVault(target, bridgeRoot))
+                {
+                    RemoveJunction(sub);
+                    continue;
+                }
 
                 names.Add(name);
                 targets.Add(target.TrimEnd('\\'));
@@ -396,6 +492,82 @@ namespace OpenInObsidian
 
             created = true;
             return link;
+        }
+
+        // -----------------------------------------------------------------------
+        // Bridge vault size control: last-used tracking + eviction
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Last-used times for the bridge links, from the sidecar next to this
+        /// exe (one "name<TAB>ticks" line per link). A missing or corrupt file
+        /// just means every link starts out "stale"; nothing here may throw.
+        /// </summary>
+        private static Dictionary<string, long> LoadMountState()
+        {
+            var mounts = new Dictionary<string, long>();
+            try
+            {
+                string stateFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, MountStateFile);
+                foreach (string line in File.ReadAllLines(stateFile))
+                {
+                    int tab = line.IndexOf('\t');
+                    long ticks;
+                    if (tab > 0 && long.TryParse(line.Substring(tab + 1), out ticks))
+                    {
+                        mounts[line.Substring(0, tab)] = ticks;
+                    }
+                }
+            }
+            catch { }
+            return mounts;
+        }
+
+        private static void SaveMountState(Dictionary<string, long> mounts)
+        {
+            try
+            {
+                string stateFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, MountStateFile);
+                var lines = new List<string>(mounts.Count);
+                foreach (var pair in mounts)
+                {
+                    lines.Add(pair.Key + "\t" + pair.Value);
+                }
+                File.WriteAllLines(stateFile, lines);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Removes junctions until at most MaxMountedLinks remain, evicting the
+        /// least recently used first (unknown last-use counts as oldest). The
+        /// link currently being used is never evicted, so opening a file can
+        /// never evict its own mount mid-flight.
+        /// </summary>
+        private static void EvictOverCap(string bridge, List<string> names,
+            Dictionary<string, long> mounts, string keepName)
+        {
+            while (names.Count > MaxMountedLinks)
+            {
+                int stalest = -1;
+                long oldest = long.MaxValue;
+                for (int i = 0; i < names.Count; i++)
+                {
+                    if (string.Equals(names[i], keepName, StringComparison.OrdinalIgnoreCase)) { continue; }
+                    long used;
+                    if (!mounts.TryGetValue(names[i], out used)) { used = 0; }
+                    if (used < oldest)
+                    {
+                        oldest = used;
+                        stalest = i;
+                    }
+                }
+                if (stalest < 0) { break; }
+
+                RemoveJunction(Path.Combine(bridge, names[stalest]));
+                mounts.Remove(names[stalest]);
+                names.RemoveAt(stalest);
+            }
         }
 
         /// <summary>

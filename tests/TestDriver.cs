@@ -39,6 +39,12 @@ internal static class TestDriver
         MethodInfo removeJunction = RequireMethod(t, "RemoveJunction");
         MethodInfo selectLink = RequireMethod(t, "SelectLink");
         MethodInfo readBridgeLinks = RequireMethod(t, "ReadBridgeLinks");
+        MethodInfo overlapsBridge = RequireMethod(t, "OverlapsBridgeVault");
+        MethodInfo evictOverCap = RequireMethod(t, "EvictOverCap");
+        MethodInfo loadState = RequireMethod(t, "LoadMountState");
+        MethodInfo saveState = RequireMethod(t, "SaveMountState");
+        FieldInfo capField = t.GetField("MaxMountedLinks",
+            BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
 
         // Redirect the config-path seam to our fixture (env-var APPDATA changes
         // do NOT work: GetFolderPath resolves CSIDL_APPDATA from the registry).
@@ -203,6 +209,101 @@ internal static class TestDriver
             && underParent == Path.Combine(parentLink, "child")
             && deeper[4] is bool && !(bool)deeper[4]);
 
+        // --- 11. recursion guard: folders overlapping the bridge vault ---
+        // Regression for the bug seen in the wild: the bridge vault lives under
+        // C:\Users\...\OpenInObsidian\vault, a file directly in C:\Users got a
+        // junction to C:\Users, and Obsidian's indexer then walked the vault
+        // inside its own mount on every vault load (minute-long loads, hangs).
+        string vaultRootExample = @"C:\Users\Administrator\AppData\Local\OpenInObsidian\vault\";
+        Check("folder inside the bridge vault overlaps",
+            (bool)overlapsBridge.Invoke(null, new object[]
+                { Path.Combine(vaultRootExample.TrimEnd('\\'), "sub"), vaultRootExample }));
+        Check("the bridge vault itself overlaps",
+            (bool)overlapsBridge.Invoke(null, new object[] { vaultRootExample.TrimEnd('\\'), vaultRootExample }));
+        Check("an ancestor of the bridge vault overlaps",
+            (bool)overlapsBridge.Invoke(null, new object[] { @"C:\Users", vaultRootExample }));
+        Check("an unrelated folder does not overlap",
+            !(bool)overlapsBridge.Invoke(null, new object[] { @"E:\docs", vaultRootExample }));
+
+        // --- 12. self-heal: dangling junctions are pruned ---
+        string danglingTarget = Path.Combine(work, "dangling-target");
+        Directory.CreateDirectory(danglingTarget);
+        string danglingLink = Path.Combine(bridge, "dangling");
+        bool danglingSetUp = (bool)createJunction.Invoke(null, new object[] { danglingLink, danglingTarget });
+        Check("dangling junction set up", danglingSetUp);
+        Directory.Delete(danglingTarget);   // target gone -> junction dangles
+
+        ReadLinks(readBridgeLinks, bridge, names, targets);
+        Check("dangling link pruned from the bridge", !BridgeHasEntry(bridge, "dangling"));
+        Check("healthy links survive the pruning",
+            names.Count == 1 && targets.Count == 1 && targets[0] == parentDir);
+
+        // --- 13. self-heal: a link mounting an ancestor of the bridge is pruned ---
+        string upLink = Path.Combine(bridge, "up-link");
+        Check("recursive junction set up",
+            (bool)createJunction.Invoke(null, new object[] { upLink, work }));
+        ReadLinks(readBridgeLinks, bridge, names, targets);
+        Check("ancestor-mounting link pruned", !BridgeHasEntry(bridge, "up-link"));
+        Check("DATA SAFETY: the bridge vault survived the ancestor-link pruning",
+            Directory.Exists(bridge) && Directory.Exists(Path.Combine(work, "real-folder")));
+
+        // --- 14. LRU: stalest mounts are evicted beyond the cap ---
+        int savedCap = (int)capField.GetValue(null);
+        capField.SetValue(null, 2);
+        try
+        {
+            string lruA = Path.Combine(work, "lru-a");
+            string lruB = Path.Combine(work, "lru-b");
+            string lruC = Path.Combine(work, "lru-c");
+            Directory.CreateDirectory(lruA);
+            Directory.CreateDirectory(lruB);
+            Directory.CreateDirectory(lruC);
+            File.WriteAllText(Path.Combine(lruA, "a.md"), "a");
+            File.WriteAllText(Path.Combine(lruB, "b.md"), "b");
+            File.WriteAllText(Path.Combine(lruC, "c.md"), "c");
+            createJunction.Invoke(null, new object[] { Path.Combine(bridge, "lru-a"), lruA });
+            createJunction.Invoke(null, new object[] { Path.Combine(bridge, "lru-b"), lruB });
+            createJunction.Invoke(null, new object[] { Path.Combine(bridge, "lru-c"), lruC });
+
+            ReadLinks(readBridgeLinks, bridge, names, targets);   // parent, lru-a/b/c
+            Check("four mounts exist before eviction", names.Count == 4);
+
+            var mountTimes = new Dictionary<string, long>();
+            // The parent junction's real name carries the hash suffix from
+            // LinkNameFor; state keys must match it exactly.
+            string parentName = Path.GetFileName(parentLink);
+            mountTimes[parentName] = 200;   // second-stalest
+            mountTimes["lru-a"] = 300;
+            mountTimes["lru-b"] = 100;      // stalest
+            mountTimes["lru-c"] = 400;      // freshest, also the keep-name
+            evictOverCap.Invoke(null, new object[] { bridge, names, mountTimes, "lru-c" });
+
+            Check("cap lowered to 2 -> evicted down to two links", names.Count == 2);
+            Check("stalest link evicted first", !BridgeHasEntry(bridge, "lru-b"));
+            Check("second-stalest link evicted next", !BridgeHasEntry(bridge, parentName));
+            Check("recent links kept", BridgeHasEntry(bridge, "lru-a") && BridgeHasEntry(bridge, "lru-c"));
+            Check("eviction also drops the state-map entries",
+                mountTimes.Count == 2 && mountTimes.ContainsKey("lru-a") && mountTimes.ContainsKey("lru-c"));
+            Check("DATA SAFETY: evicted mount's real folder survived",
+                File.Exists(Path.Combine(parentDir, "child", "deep.md"))
+                && File.Exists(Path.Combine(lruB, "b.md")));
+        }
+        finally
+        {
+            capField.SetValue(null, savedCap);
+        }
+
+        // --- 15. mount state sidecar round trip ---
+        var state = new Dictionary<string, long>();
+        state["link with spaces (abc123)"] = 637000000000000000L;
+        saveState.Invoke(null, new object[] { state });
+        var loaded = (Dictionary<string, long>)loadState.Invoke(null, null);
+        Check("mount state survives a save/load round trip",
+            loaded != null && loaded.Count == 1
+            && loaded.ContainsKey("link with spaces (abc123)")
+            && loaded["link with spaces (abc123)"] == 637000000000000000L);
+        File.Delete(Path.Combine(work, "mounts.txt"));
+
         Console.WriteLine();
         Console.WriteLine(failures == 0 ? "ALL TESTS PASSED" : "FAILURES: " + failures);
         return failures == 0 ? 0 : 1;
@@ -221,6 +322,23 @@ internal static class TestDriver
         targets.Clear();
         names.AddRange((List<string>)args[1]);
         targets.AddRange((List<string>)args[2]);
+    }
+
+    /// <summary>
+    /// True when the bridge vault folder contains an entry with the given name
+    /// (a dangling junction still lists here even though Directory.Exists on
+    /// its path returns false).
+    /// </summary>
+    private static bool BridgeHasEntry(string bridge, string entryName)
+    {
+        foreach (string sub in Directory.GetDirectories(bridge))
+        {
+            if (string.Equals(Path.GetFileName(sub), entryName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void WriteObsidianJson(string json)
