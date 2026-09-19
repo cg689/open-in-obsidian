@@ -5,8 +5,11 @@
 .DESCRIPTION
   Removes the "Obsidian.md" ProgId, drops it from the "Open with" list, clears
   the .md default (per-user only), unregisters the bridge vault from Obsidian's
-  vault list and deletes the bridge vault folder. Explorer is notified
-  immediately. After running this, pick whichever editor you like via
+  vault list and deletes the bridge vault folder. The vault folder is only
+  deleted once obsidian.json no longer lists it; while Obsidian is running (or
+  the vault list cannot be edited safely) the folder is kept - re-run the
+  script after resolving that. Explorer is notified immediately. After running
+  this, pick whichever editor you like via
   right-click -> Open with -> Choose another app.
 
   The bridge vault contains directory junctions pointing at folders elsewhere on
@@ -29,19 +32,28 @@ $bridgeVault = Join-Path $InstallDir "vault"
 # Removes just the bridge vault entry from Obsidian's vault list, textually, so
 # the rest of the file (including the user's own vaults) is left byte-for-byte
 # as Obsidian wrote it. The result is re-parsed before being written back.
+#
+# Returns a small report: Removed = $true when the vault list no longer
+# references the bridge vault (removed now, or never was), $false when it
+# still does. The caller must only delete the vault folder when $true -
+# deleting it while Obsidian still lists it leaves a dangling entry whose
+# path a later uninstall can no longer match.
 # ---------------------------------------------------------------------------
 function Unregister-BridgeVault
 {
     param([string]$VaultPath)
 
     $cfg = Join-Path $env:APPDATA "obsidian\obsidian.json"
-    if (-not (Test-Path -LiteralPath $cfg)) { return "obsidian.json not found - nothing to unregister." }
+    if (-not (Test-Path -LiteralPath $cfg))
+    {
+        return @{ Removed = $true; Note = "obsidian.json not found - nothing to unregister." }
+    }
 
     $raw = [System.IO.File]::ReadAllText($cfg)
     $parsed = $null
     try { $parsed = $raw | ConvertFrom-Json }
-    catch { return "obsidian.json is not valid JSON - left untouched." }
-    if (-not $parsed.vaults) { return $null }
+    catch { return @{ Removed = $false; Note = "obsidian.json is not valid JSON - left untouched." } }
+    if (-not $parsed.vaults) { return @{ Removed = $true; Note = $null } }
 
     $wanted = $VaultPath.TrimEnd('\')
     $id = $null
@@ -50,15 +62,15 @@ function Unregister-BridgeVault
         $vp = $prop.Value.path
         if ($vp -and $vp.TrimEnd('\') -ieq $wanted) { $id = $prop.Name; break }
     }
-    if (-not $id) { return $null }
+    if (-not $id) { return @{ Removed = $true; Note = $null } }
 
     if (Get-Process -Name Obsidian -ErrorAction SilentlyContinue)
     {
-        return "Obsidian is running. Close it completely and re-run uninstall to clean the vault list."
+        return @{ Removed = $false; Note = "Obsidian is running. Close it completely and re-run uninstall to clean the vault list." }
     }
 
     $at = $raw.IndexOf('"' + $id + '":')
-    if ($at -lt 0) { return "could not locate the bridge vault entry - left untouched." }
+    if ($at -lt 0) { return @{ Removed = $false; Note = "could not locate the bridge vault entry - left untouched." } }
 
     # Walk the entry's object literal to find where it ends.
     $start = $raw.IndexOf('{', $at)
@@ -73,7 +85,7 @@ function Unregister-BridgeVault
             if ($depth -eq 0) { $end = $i; break }
         }
     }
-    if ($end -lt 0) { return "could not parse the bridge vault entry - left untouched." }
+    if ($end -lt 0) { return @{ Removed = $false; Note = "could not parse the bridge vault entry - left untouched." } }
 
     $before = $raw.Substring(0, $at)
     $after = $raw.Substring($end + 1)
@@ -84,10 +96,10 @@ function Unregister-BridgeVault
 
     $updated = $before + $after
     try { $updated | ConvertFrom-Json | Out-Null }
-    catch { return "refusing to write: the updated obsidian.json would not be valid JSON." }
+    catch { return @{ Removed = $false; Note = "refusing to write: the updated obsidian.json would not be valid JSON." } }
 
     [System.IO.File]::WriteAllText($cfg, $updated, (New-Object System.Text.UTF8Encoding($false)))
-    return $null
+    return @{ Removed = $true; Note = $null }
 }
 
 Write-Host "== Open in Obsidian - uninstall ==" -ForegroundColor Cyan
@@ -146,19 +158,27 @@ if (Test-Path $mdKey)
 }
 
 # 3. Unregister the bridge vault from Obsidian's vault list.
-$vaultNote = Unregister-BridgeVault -VaultPath $bridgeVault
-if ($vaultNote)
+$vault = Unregister-BridgeVault -VaultPath $bridgeVault
+if ($vault.Note)
 {
-    Write-Host "[3/5] Bridge vault   : $vaultNote" -ForegroundColor Yellow
+    Write-Host "[3/5] Bridge vault   : $($vault.Note)" -ForegroundColor Yellow
 }
-else
+elseif ($vault.Removed)
 {
     Write-Host "[3/5] Bridge vault   : unregistered from Obsidian"
 }
 
-# 4. Delete the bridge vault, junctions first and never recursively through them.
-$vaultRemoved = $true
-if (Test-Path -LiteralPath $bridgeVault)
+# 4. Delete the bridge vault, junctions first and never recursively through
+#    them. Only once the vault list no longer references it: deleting the
+#    folder while Obsidian still lists it would leave a dangling entry whose
+#    path a later uninstall can no longer match.
+$vaultRemoved = $false
+if (-not $vault.Removed)
+{
+    Write-Host "[4/5] Bridge vault   : KEPT - still registered with Obsidian (see the note above)." -ForegroundColor Yellow
+    Write-Host "      Resolve that, then re-run this script to finish the cleanup." -ForegroundColor Yellow
+}
+elseif (Test-Path -LiteralPath $bridgeVault)
 {
     Add-Type -Namespace Win32 -Name NativeDir -MemberDefinition @'
 [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -188,11 +208,13 @@ public static extern bool RemoveDirectory(string pathName);
     {
         Remove-Item -LiteralPath $bridgeVault -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host "[4/5] Bridge vault   : deleted"
+        $vaultRemoved = $true
     }
 }
 else
 {
     Write-Host "[4/5] Bridge vault   : not present (nothing to do)."
+    $vaultRemoved = $true
 }
 
 # 5. Notify Explorer.

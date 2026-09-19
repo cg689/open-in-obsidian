@@ -30,13 +30,17 @@ namespace OpenInObsidian
     ///                          obsidian://open?path=...  which makes Obsidian open
     ///                          and focus exactly that file.
     ///
-    ///     - Outside a vault -> mount it into the "bridge" vault (see below) and
-    ///                          dispatch the same URI with the bridged path. Only if
-    ///                          that is not possible do we hand the file to an
-    ///                          ordinary editor: fallback-editor.txt -> Typora ->
-    ///                          VS Code -> Notepad.
-    ///
-    /// The bridge vault:
+///     - Outside a vault -> mount it into the "bridge" vault (see below) and
+///                          dispatch the same URI with the bridged path. Only if
+///                          that is not possible do we hand the file to an
+///                          ordinary editor: fallback-editor.txt -> Typora ->
+///                          VS Code -> Notepad.
+///
+///   A broken obsidian:// handler (Obsidian uninstalled, handler deregistered)
+///   lands in the same fallback editor: a dead double-click is the one outcome
+///   this helper must never produce.
+///
+/// The bridge vault:
     ///   Obsidian documents that a vault may contain symlinks and junctions that
     ///   point outside the vault, and it will index and edit the files behind them.
     ///   So next to this exe we keep a small vault ("vault\") whose entire content
@@ -91,6 +95,18 @@ namespace OpenInObsidian
                 "obsidian", "obsidian.json");
         };
 
+        /// <summary>
+        /// Seam for unit tests: how a URI reaches the shell. Production keeps
+        /// the default, which really starts the URI; tests swap in a stub so
+        /// nothing outside their temp directory is ever launched.
+        /// Private is fine: the test driver reaches it via reflection.
+        /// </summary>
+        private static Func<string, bool> StartUri = delegate(string uri)
+        {
+            Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true });
+            return true;
+        };
+
         [STAThread]
         private static void Main(string[] args)
         {
@@ -126,7 +142,12 @@ namespace OpenInObsidian
 
                 if (inVault)
                 {
-                    Dispatch(path);
+                    if (!Dispatch(path))
+                    {
+                        // No working obsidian:// handler - a dead click is worse
+                        // than another editor.
+                        OpenWithFallback(path);
+                    }
                 }
                 else if (!TryOpenInBridgeVault(path, vaults))
                 {
@@ -144,14 +165,21 @@ namespace OpenInObsidian
 
         /// <summary>
         /// Hands the path to Obsidian's official protocol, which opens and focuses
-        /// exactly that file (or does nothing, if no registered vault contains it).
+        /// exactly that file. Returns false when the obsidian:// handler itself is
+        /// missing or broken, so the caller can fall back to an ordinary editor
+        /// instead of leaving the double-click dead.
         /// </summary>
-        private static void Dispatch(string path)
+        private static bool Dispatch(string path)
         {
-            Process.Start(new ProcessStartInfo("obsidian://open?path=" + Uri.EscapeDataString(path))
+            try
             {
-                UseShellExecute = true
-            });
+                return StartUri("obsidian://open?path=" + Uri.EscapeDataString(path));
+            }
+            catch (Exception ex)
+            {
+                LogError("dispatching obsidian://open", ex);
+                return false;
+            }
         }
 
         /// <summary>
@@ -316,11 +344,19 @@ namespace OpenInObsidian
                 // vault load slower. Track last use and evict the stalest links
                 // beyond the cap - never the one about to be used. Deleting a
                 // junction only removes the link, never the real folder.
+                //
+                // names/targets are stale by now: SelectLink drops nested-conflict
+                // junctions and creates the new one behind their back. Re-read so
+                // eviction counts what the bridge vault really holds - otherwise
+                // a conflict cleanup at the cap evicts a healthy link that was
+                // never over the limit.
+                ReadBridgeLinks(bridge, out names, out targets);
+
                 string linkName = linkPath.Substring(bridgeRoot.Length).Split('\\')[0];
-                if (!names.Contains(linkName)) { names.Add(linkName); }
                 Dictionary<string, long> mounts = LoadMountState();
                 mounts[linkName] = DateTime.UtcNow.Ticks;
                 EvictOverCap(bridge, names, mounts, linkName);
+                PruneMountState(mounts, names);
                 SaveMountState(mounts);
 
                 string bridged = Path.Combine(linkPath, Path.GetFileName(path));
@@ -337,7 +373,10 @@ namespace OpenInObsidian
                 // loads the bridge vault, so waiting would only add latency.
                 if (mountedNow && IsObsidianRunning()) { Thread.Sleep(1200); }
 
-                Dispatch(bridged);
+                if (!Dispatch(bridged))
+                {
+                    return Fallback("obsidian:// dispatch failed for " + bridged);
+                }
                 return true;
             }
             catch (Exception ex)
@@ -539,6 +578,24 @@ namespace OpenInObsidian
         }
 
         /// <summary>
+        /// Drops mount-state entries whose link is gone (removed by SelectLink's
+        /// nested-conflict cleanup, by hand, or by another run) so the sidecar
+        /// never accumulates dead names.
+        /// </summary>
+        private static void PruneMountState(Dictionary<string, long> mounts, List<string> names)
+        {
+            List<string> dead = new List<string>();
+            foreach (string name in mounts.Keys)
+            {
+                if (!names.Contains(name)) { dead.Add(name); }
+            }
+            for (int i = 0; i < dead.Count; i++)
+            {
+                mounts.Remove(dead[i]);
+            }
+        }
+
+        /// <summary>
         /// Removes junctions until at most MaxMountedLinks remain, evicting the
         /// least recently used first (unknown last-use counts as oldest). The
         /// link currently being used is never evicted, so opening a file can
@@ -668,6 +725,22 @@ namespace OpenInObsidian
         }
 
         /// <summary>
+        /// The substitute name the filesystem resolves: "\??\C:\dir" for local
+        /// paths, "\??\UNC\server\share" for network paths. Gluing "\??\" onto a
+        /// "\\server\share" target produces an invalid spelling that
+        /// FSCTL_SET_REPARSE_POINT always rejects - which used to push every file
+        /// on a network share to the fallback editor.
+        /// </summary>
+        private static string SubstituteNameFor(string targetPath)
+        {
+            if (targetPath.StartsWith(@"\\", StringComparison.Ordinal))
+            {
+                return @"\??\UNC\" + targetPath.Substring(2);
+            }
+            return @"\??\" + targetPath;
+        }
+
+        /// <summary>
         /// Creates a junction at <paramref name="linkPath"/> pointing at
         /// <paramref name="targetPath"/>. Returns false (leaving nothing behind)
         /// when the link path is already taken or the reparse point can't be set.
@@ -684,10 +757,11 @@ namespace OpenInObsidian
                 cleanupNeeded = true;
 
                 // The reparse buffer carries two copies of the target: the
-                // "substitute" name (\??\C:\dir, what the filesystem resolves) and
-                // the "print" name (C:\dir, what tools display). Windows expects
-                // both, each null-terminated.
-                byte[] substitute = Encoding.Unicode.GetBytes(@"\??\" + targetPath);
+                // "substitute" name (\??\C:\dir, or \??\UNC\server\share for
+                // network paths - what the filesystem resolves) and the "print"
+                // name (C:\dir, what tools display). Windows expects both, each
+                // null-terminated.
+                byte[] substitute = Encoding.Unicode.GetBytes(SubstituteNameFor(targetPath));
                 byte[] print = Encoding.Unicode.GetBytes(targetPath);
                 int pathBufferLength = substitute.Length + 2 + print.Length + 2;
 
@@ -782,7 +856,13 @@ namespace OpenInObsidian
                     new IntPtr(buffer.ToInt64() + ReparseHeaderSize + offset), length / 2);
                 if (substitute == null) { return null; }
 
-                // "\??\C:\dir" (and the \\?\ spelling) -> "C:\dir".
+                // "\??\C:\dir" and "\\?\C:\dir" spellings -> "C:\dir";
+                // "\??\UNC\server\share" and "\\?\UNC\..." -> "\\server\share".
+                if (substitute.StartsWith(@"\??\UNC\", StringComparison.Ordinal)
+                    || substitute.StartsWith(@"\\?\UNC\", StringComparison.Ordinal))
+                {
+                    return @"\\" + substitute.Substring(8);
+                }
                 if (substitute.StartsWith(@"\??\", StringComparison.Ordinal)
                     || substitute.StartsWith(@"\\?\", StringComparison.Ordinal))
                 {
@@ -811,7 +891,13 @@ namespace OpenInObsidian
         {
             try
             {
-                RemoveDirectoryW(linkPath);
+                if (!RemoveDirectoryW(linkPath))
+                {
+                    // P/Invoke bools report failure by returning false, not by
+                    // throwing - without this the error would vanish, exactly
+                    // what LogWin32 exists to prevent.
+                    LogWin32("removing junction " + linkPath);
+                }
             }
             catch (Exception ex)
             {

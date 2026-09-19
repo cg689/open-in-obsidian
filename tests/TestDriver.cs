@@ -8,7 +8,9 @@ using System.Reflection;
 // Run via tests\run-tests.ps1, which compiles both projects into a temp
 // directory and executes this driver there. The driver never launches
 // Obsidian or any editor and never touches the real Obsidian config: it
-// swaps the ObsidianConfigPath seam to a fixture file inside the temp dir.
+// swaps the ObsidianConfigPath seam to a fixture file inside the temp dir
+// and stubs the URI-launcher seam (StartUri), so dispatching is never
+// really performed.
 //
 // The junction tests do create real directory junctions - but only inside the
 // temp directory, pointing at other folders inside the temp directory.
@@ -43,6 +45,10 @@ internal static class TestDriver
         MethodInfo evictOverCap = RequireMethod(t, "EvictOverCap");
         MethodInfo loadState = RequireMethod(t, "LoadMountState");
         MethodInfo saveState = RequireMethod(t, "SaveMountState");
+        MethodInfo dispatch = RequireMethod(t, "Dispatch");
+        MethodInfo tryBridge = RequireMethod(t, "TryOpenInBridgeVault");
+        FieldInfo startUri = t.GetField("StartUri",
+            BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
         FieldInfo capField = t.GetField("MaxMountedLinks",
             BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
 
@@ -303,6 +309,93 @@ internal static class TestDriver
             && loaded.ContainsKey("link with spaces (abc123)")
             && loaded["link with spaces (abc123)"] == 637000000000000000L);
         File.Delete(Path.Combine(work, "mounts.txt"));
+
+        // --- 16. dispatch reports failure instead of throwing, so the caller
+        // can fall back to an editor instead of leaving the click dead ---
+        // The URI-launcher seam is stubbed, so no URI is ever really started.
+        startUri.SetValue(null, (Func<string, bool>)delegate { return true; });
+        Check("dispatch succeeds when the shell starts the URI",
+            (bool)dispatch.Invoke(null, new object[] { @"E:\docs\note.md" }));
+        startUri.SetValue(null, (Func<string, bool>)delegate
+        {
+            throw new System.ComponentModel.Win32Exception(2, "no handler");
+        });
+        Check("dispatch with a broken handler returns false (not an exception)",
+            !(bool)dispatch.Invoke(null, new object[] { @"E:\docs\note.md" }));
+        Check("a failed dispatch is logged",
+            File.Exists(log) && File.ReadAllText(log).Contains("dispatching obsidian://open"));
+
+        // --- 17. junctions to UNC network paths use the \??\UNC\ spelling ---
+        // A fake share keeps this offline: setting a mount point does not
+        // validate the target, and GetJunctionTarget reads the link's own
+        // reparse data, never the target.
+        string uncLink = Path.Combine(linkRoot, "unc-link");
+        string uncTarget = @"\\fake-server\fake-share\docs";
+        bool uncCreated = (bool)createJunction.Invoke(null, new object[] { uncLink, uncTarget });
+        Check("junction to a UNC path created", uncCreated);
+        Check("UNC target reads back",
+            (string)getJunctionTarget.Invoke(null, new object[] { uncLink }) == uncTarget);
+        removeJunction.Invoke(null, new object[] { uncLink });
+        Check("UNC junction removed", !Directory.Exists(uncLink));
+
+        // --- 18. bridge mount end-to-end, with the LRU state kept in sync ---
+        // Drives TryOpenInBridgeVault for real (dispatch stubbed): mounting a
+        // parent folder drops the nested child junction, and neither the stale
+        // link list left behind by that cleanup nor dead sidecar entries may
+        // skew eviction. Regression for healthy mounts being evicted although
+        // the bridge was never actually over the cap.
+        startUri.SetValue(null, (Func<string, bool>)delegate { return true; });
+        string bridgeVault = Path.Combine(work, "vault");
+        string mountParent = Path.Combine(work, "mount-parent");
+        string mountChild = Path.Combine(mountParent, "child");
+        string mountOther = Path.Combine(work, "mount-other");
+        Directory.CreateDirectory(bridgeVault);
+        Directory.CreateDirectory(mountChild);
+        Directory.CreateDirectory(mountOther);
+        createJunction.Invoke(null, new object[] { Path.Combine(bridgeVault, "l-child"), mountChild });
+        createJunction.Invoke(null, new object[] { Path.Combine(bridgeVault, "l-other"), mountOther });
+
+        // l-child is fresh (it will be conflict-removed any moment), l-other is
+        // old and healthy, "ghost" has no link behind it at all.
+        File.WriteAllText(Path.Combine(work, "mounts.txt"),
+            "l-child\t999999999999999999\nl-other\t100\nghost\t50");
+
+        int savedCap2 = (int)capField.GetValue(null);
+        capField.SetValue(null, 2);
+        try
+        {
+            var bridgeVaults = new List<string>();
+            bridgeVaults.Add(bridgeVault.TrimEnd('\\') + "\\");
+            object[] mount = { Path.Combine(mountParent, "note.md"), bridgeVaults };
+            Check("bridge mount succeeds end-to-end", (bool)tryBridge.Invoke(null, mount));
+
+            ReadLinks(readBridgeLinks, bridgeVault, names, targets);
+            Check("nested child junction replaced by the parent mount",
+                !BridgeHasEntry(bridgeVault, "l-child"));
+            Check("the healthy old mount was NOT evicted (stale names must not inflate the count)",
+                BridgeHasEntry(bridgeVault, "l-other"));
+            Check("bridge holds exactly the parent and the old mount",
+                names.Count == 2 && targets.Contains(mountParent) && targets.Contains(mountOther));
+
+            string parentLinkName = null;
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (targets[i] == mountParent) { parentLinkName = names[i]; }
+            }
+            var liveState = (Dictionary<string, long>)loadState.Invoke(null, null);
+            Check("mount state keeps exactly the live links (dead and ghost entries pruned)",
+                liveState != null && liveState.Count == 2
+                && liveState.ContainsKey("l-other")
+                && parentLinkName != null && liveState.ContainsKey(parentLinkName)
+                && !liveState.ContainsKey("l-child") && !liveState.ContainsKey("ghost"));
+            Check("the fresh mount's timestamp was recorded",
+                parentLinkName != null && liveState.ContainsKey(parentLinkName)
+                && liveState[parentLinkName] > 100);
+        }
+        finally
+        {
+            capField.SetValue(null, savedCap2);
+        }
 
         Console.WriteLine();
         Console.WriteLine(failures == 0 ? "ALL TESTS PASSED" : "FAILURES: " + failures);

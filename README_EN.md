@@ -51,7 +51,7 @@ OpenInObsidian.exe   ← GUI-subsystem program: no console window by design, zer
 
 ### Highlights
 
-- **Zero dependencies**: nothing to download. The installer compiles a forwarder (~940 lines, vault detection, bridge mounting and fallback included) using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
+- **Zero dependencies**: nothing to download. The installer compiles a forwarder (~1,030 lines, vault detection, bridge mounting and fallback included) using the .NET Framework compiler that ships with Windows — the source is right there in `src/`, so you can see exactly what gets installed
 - **Zero popups**: compiled with `/target:winexe`, a GUI-subsystem program with no console window at all — nothing ever flashes
 - **Vault-external files open in Obsidian too**: the file's folder is mounted into a dedicated "bridge" vault as a directory junction, so `.md` files outside every vault open in Obsidian as well — editable and searchable. The real files never move and none of your own vaults are touched (see below)
 - **Falls back when unsure**: when the bridge isn't usable (not registered, file at a drive root, path too long) it opens in Typora / VS Code / Notepad instead — a double-click never just does nothing (customizable via `fallback-editor.txt`, see FAQ)
@@ -104,7 +104,7 @@ After installing, double-click any `.md` — inside a vault it opens directly, o
 powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 ```
 
-This removes the file association, restores your previous `.md` default (automatically backed up at install time), unregisters the bridge vault from Obsidian's vault list and deletes the bridge vault folder.
+This removes the file association, restores your previous `.md` default (automatically backed up at install time), unregisters the bridge vault from Obsidian's vault list and deletes the bridge vault folder. The vault folder is only deleted once `obsidian.json` no longer references it — while Obsidian is running (or the vault list can't be edited safely) it is kept, and the script asks you to resolve that and re-run.
 
 > The bridge vault holds nothing but directory junctions, so the uninstall script **removes each junction non-recursively first** and only deletes the folder once nothing is left — a recursive delete would follow the junctions and wipe the real folders they point at.
 
@@ -187,7 +187,7 @@ open-in-obsidian/
 │   └── uninstall.ps1        # one-command uninstall
 ├── tests/
 │   ├── run-tests.ps1        # one-command test run (compiles into a temp dir, never touches your real config)
-│   └── TestDriver.cs        # 40 unit tests (vault parsing / nested matching / link naming / junction create-read-delete / fallback config / error log)
+│   └── TestDriver.cs        # 70 unit tests (vault parsing / nested matching / link naming / junction create-read-delete incl. UNC / fallback config / error log / dispatch fallback / bridge end-to-end)
 ├── LICENSE
 ├── README.md                # Chinese docs
 └── README_EN.md             # English docs
@@ -201,7 +201,7 @@ Want to verify changes to the source? No install needed:
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
 
-Tests compile the source into a temp directory and drive it via reflection, covering vault parsing (Chinese paths, forward-slash normalization, prefix-overlap boundaries), degraded behavior on malformed / missing configs, fallback-editor.txt reading, and the error log — plus the bridge side: link naming and the stable hash, a create/read/delete round trip for a directory junction, and the nested-folder conflict cleanup.
+Tests compile the source into a temp directory and drive it via reflection, covering vault parsing (Chinese paths, forward-slash normalization, prefix-overlap boundaries), degraded behavior on malformed / missing configs, fallback-editor.txt reading, and the error log — plus the bridge side: link naming and the stable hash, a create/read/delete round trip for a directory junction (including a UNC network target), the nested-folder conflict cleanup, the dispatch contract (returns false instead of throwing when the obsidian:// handler is broken), and a bridge-mount end-to-end run that keeps the LRU state in sync with the junctions actually on disk (a conflict cleanup at the cap no longer evicts healthy mounts).
 
 The junction tests do create real directory junctions, but only inside the temp directory and pointing at folders inside it. Nothing launches Obsidian or touches your real `obsidian.json`. Two assertions guard data safety specifically: after removing a junction the target folder must still be there, and after the conflict cleanup the subfolder's contents must be intact.
 
