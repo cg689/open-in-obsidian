@@ -72,6 +72,17 @@ namespace OpenInObsidian
         private const string MountStateFile = "mounts.txt";
 
         /// <summary>
+        /// Named mutex serialising the bridge-vault mount + dispatch across
+        /// concurrent double-clicks. Without it, two instances racing a moment
+        /// apart rewrite mounts.txt over each other, or one evicts a junction the
+        /// other is about to use, so the very first open of a file can look like a
+        /// no-op or open the wrong thing. The Local\ prefix scopes the lock to
+        /// this interactive session (where double-clicks arrive) and needs no
+        /// elevated privilege.
+        /// </summary>
+        private const string BridgeLockName = @"Local\OpenInObsidian.Bridge";
+
+        /// <summary>
         /// Cap on mounted links. Obsidian indexes every mounted folder in full,
         /// so an unbounded bridge vault would make every vault load slower and
         /// slower. A static field rather than a const so the test driver can
@@ -301,8 +312,38 @@ namespace OpenInObsidian
         /// </summary>
         private static bool TryOpenInBridgeVault(string path, List<string> vaults)
         {
+            Mutex bridgeLock = null;
+            bool holdingLock = false;
             try
             {
+                // Serialize against a concurrent double-click so we never fight
+                // over the junctions and mounts.txt (see BridgeLockName). If the
+                // lock cannot be taken within a generous window, proceed anyway:
+                // a slightly racy open beats a dead click, and the state self-heals.
+                try
+                {
+                    bool createdNew;
+                    bridgeLock = new Mutex(false, BridgeLockName, out createdNew);
+                    try
+                    {
+                        holdingLock = bridgeLock.WaitOne(TimeSpan.FromSeconds(8));
+                    }
+                    catch (AbandonedMutexException)
+                    {
+                        // A previous owner died without releasing; ownership is
+                        // handed to us by the wait, so treat it as acquired.
+                        holdingLock = true;
+                    }
+                    if (!holdingLock)
+                    {
+                        LogError("taking bridge lock", new TimeoutException("bridge lock wait timed out"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogError("taking bridge lock", ex);
+                }
+
                 string bridge = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, BridgeVaultFolder);
                 string bridgeRoot = bridge.TrimEnd('\\') + "\\";
 
@@ -383,6 +424,16 @@ namespace OpenInObsidian
             {
                 LogError("opening in bridge vault", ex);
                 return false;
+            }
+            finally
+            {
+                // Release only what we actually took; Close always, so the handle
+                // does not leak into the next double-click.
+                if (bridgeLock != null)
+                {
+                    if (holdingLock) { try { bridgeLock.ReleaseMutex(); } catch { } }
+                    try { bridgeLock.Close(); } catch { }
+                }
             }
         }
 
@@ -917,26 +968,26 @@ namespace OpenInObsidian
         /// </summary>
         private static void OpenWithFallback(string path)
         {
+            // Ordered candidates: a configured editor, then Typora, then VS Code,
+            // then Notepad (always present). Each is attempted until one actually
+            // starts - an editor that is found but fails to launch must not leave
+            // the click dead, so we keep walking down to Notepad.
+            var candidates = new List<string>();
             string custom = GetCustomFallbackEditor();
-            if (custom != null)
-            {
-                StartEditor(custom, path);
-                return;
-            }
+            if (custom != null) { candidates.Add(custom); }
+            string typora = FindApp("Typora.exe");
+            if (typora != null) { candidates.Add(typora); }
+            string code = FindApp("Code.exe");
+            if (code != null) { candidates.Add(code); }
+            // Last resort: Notepad. Never Process.Start(path) - the default handler
+            // for .md is this exe itself, which would loop forever; Notepad cannot.
+            candidates.Add(Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe"));
 
-            foreach (string exe in new string[] { FindApp("Typora.exe"), FindApp("Code.exe") })
+            foreach (string exe in candidates)
             {
-                if (exe != null)
-                {
-                    StartEditor(exe, path);
-                    return;
-                }
+                if (StartEditor(exe, path)) { return; }
             }
-
-            // Last resort: Notepad. Never Process.Start(path) here - the default
-            // handler for .md is this exe itself, which would loop forever.
-            StartEditor(Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe"), path);
         }
 
         private static string GetCustomFallbackEditor()
@@ -1012,14 +1063,28 @@ namespace OpenInObsidian
             return null;
         }
 
-        private static void StartEditor(string exe, string path)
+        /// <summary>
+        /// Starts one editor on the file. Returns false (having logged why) when
+        /// the process could not be launched, so OpenWithFallback can keep walking
+        /// down its preference list rather than leaving the double-click dead.
+        /// </summary>
+        private static bool StartEditor(string exe, string path)
         {
-            Process.Start(new ProcessStartInfo
+            try
             {
-                FileName = exe,
-                Arguments = "\"" + path + "\"",
-                UseShellExecute = true
-            });
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = exe,
+                    Arguments = "\"" + path + "\"",
+                    UseShellExecute = true
+                });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogError("starting fallback editor " + exe, ex);
+                return false;
+            }
         }
     }
 }
