@@ -47,9 +47,13 @@ internal static class TestDriver
         MethodInfo saveState = RequireMethod(t, "SaveMountState");
         MethodInfo dispatch = RequireMethod(t, "Dispatch");
         MethodInfo tryBridge = RequireMethod(t, "TryOpenInBridgeVault");
+        MethodInfo countCapped = RequireMethod(t, "CountFilesCapped");
+        MethodInfo findCovering = RequireMethod(t, "FindCoveringLink");
         FieldInfo startUri = t.GetField("StartUri",
             BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
         FieldInfo capField = t.GetField("MaxMountedLinks",
+            BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
+        FieldInfo folderCapField = t.GetField("MaxFolderFiles",
             BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
 
         // Redirect the config-path seam to our fixture (env-var APPDATA changes
@@ -395,6 +399,102 @@ internal static class TestDriver
         finally
         {
             capField.SetValue(null, savedCap2);
+        }
+
+        // --- 19. CountFilesCapped: bounded file count, never follows links ---
+        // The cap is what keeps rejecting a 200k-file node_modules tree as cheap
+        // as rejecting a small folder; following junctions would defeat it.
+        string countRoot = Path.Combine(work, "count-root");
+        Directory.CreateDirectory(Path.Combine(countRoot, "sub"));
+        File.WriteAllText(Path.Combine(countRoot, "a.md"), "a");
+        File.WriteAllText(Path.Combine(countRoot, "b.md"), "b");
+        File.WriteAllText(Path.Combine(countRoot, "sub", "c.md"), "c");
+        Check("counts files recursively",
+            (int)countCapped.Invoke(null, new object[] { countRoot, 100 }) == 3);
+        Check("stops at the cap instead of counting everything",
+            (int)countCapped.Invoke(null, new object[] { countRoot, 2 }) == 2);
+        Check("missing folder counts as zero (never throws)",
+            (int)countCapped.Invoke(null, new object[]
+                { Path.Combine(work, "no-such-folder"), 100 }) == 0);
+
+        string countLinkHost = Path.Combine(work, "count-link-host");
+        string countLinkTarget = Path.Combine(work, "count-link-target");
+        Directory.CreateDirectory(countLinkHost);
+        Directory.CreateDirectory(countLinkTarget);
+        for (int i = 0; i < 30; i++)
+        {
+            File.WriteAllText(Path.Combine(countLinkTarget, "f" + i + ".md"), "x");
+        }
+        Check("junction inside the scanned tree set up",
+            (bool)createJunction.Invoke(null, new object[]
+                { Path.Combine(countLinkHost, "boom"), countLinkTarget }));
+        Check("does not descend into a junction",
+            (int)countCapped.Invoke(null, new object[] { countLinkHost, 100 }) == 0);
+
+        // --- 20. FindCoveringLink: is the folder already reachable? ---
+        string covBridge = Path.Combine(work, "cov-bridge");
+        var covNames = new List<string> { "parent (abc)" };
+        var covTargets = new List<string> { Path.Combine(work, "parent") };
+        Check("the target folder itself is covered",
+            (string)findCovering.Invoke(null, new object[]
+                { covBridge, Path.Combine(work, "parent"), covNames, covTargets })
+                == Path.Combine(covBridge, "parent (abc)"));
+        Check("a folder under the target is covered, remainder appended",
+            (string)findCovering.Invoke(null, new object[]
+                { covBridge, Path.Combine(work, "parent", "child"), covNames, covTargets })
+                == Path.Combine(covBridge, "parent (abc)", "child"));
+        Check("an unrelated folder is not covered",
+            findCovering.Invoke(null, new object[]
+                { covBridge, Path.Combine(work, "elsewhere"), covNames, covTargets }) == null);
+
+        // --- 21. oversize folders are refused, existing mounts are exempt ---
+        // Regression for the vault that stopped loading entirely: a junction to a
+        // folder holding hundreds of thousands of files made Obsidian cache all of
+        // them outside the vault, and losing that mount later left the vault stuck
+        // on "loading" forever.
+        startUri.SetValue(null, (Func<string, bool>)delegate { return true; });
+        string bigFolder = Path.Combine(work, "big-folder");
+        Directory.CreateDirectory(bigFolder);
+        for (int i = 0; i < 12; i++)
+        {
+            File.WriteAllText(Path.Combine(bigFolder, "n" + i + ".md"), "n");
+        }
+        File.WriteAllText(Path.Combine(bigFolder, "target.md"), "# t");
+
+        var guardVaults = new List<string>();
+        guardVaults.Add(bridgeVault.TrimEnd('\\') + "\\");
+
+        int savedFolderCap = (int)folderCapField.GetValue(null);
+        try
+        {
+            int linksBefore = Directory.GetDirectories(bridgeVault).Length;
+
+            // 13 files against a cap of 5 -> refused, nothing mounted, reason logged.
+            folderCapField.SetValue(null, 5);
+            object[] tooBig = { Path.Combine(bigFolder, "target.md"), guardVaults };
+            Check("oversize folder is refused", !(bool)tryBridge.Invoke(null, tooBig));
+            Check("no junction was created for the refused folder",
+                Directory.GetDirectories(bridgeVault).Length == linksBefore);
+            Check("the refusal is logged with a reason",
+                File.Exists(log) && File.ReadAllText(log).Contains("too large to mount"));
+
+            // Same folder, cap back to normal -> mounts as before.
+            folderCapField.SetValue(null, savedFolderCap);
+            object[] fits = { Path.Combine(bigFolder, "target.md"), guardVaults };
+            Check("the same folder mounts when it is under the cap",
+                (bool)tryBridge.Invoke(null, fits));
+
+            // Now that it is mounted, even an absurd cap must not break it: the
+            // file is reachable right now, and refusing would take away a mount
+            // that already works.
+            folderCapField.SetValue(null, 1);
+            object[] alreadyMounted = { Path.Combine(bigFolder, "target.md"), guardVaults };
+            Check("an existing mount is exempt from the cap",
+                (bool)tryBridge.Invoke(null, alreadyMounted));
+        }
+        finally
+        {
+            folderCapField.SetValue(null, savedFolderCap);
         }
 
         Console.WriteLine();

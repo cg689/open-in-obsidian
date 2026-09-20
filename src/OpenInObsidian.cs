@@ -54,7 +54,12 @@ namespace OpenInObsidian
     ///   vault inside itself (mounting an ancestor of the vault makes Obsidian's
     ///   indexer walk that recursion on every load - observed in the wild as
     ///   minute-long vault loads), and only the most recently used mounts are
-    ///   kept, because Obsidian indexes every mounted folder in full.
+    ///   kept, because Obsidian indexes every mounted folder in full. A folder
+    ///   holding more than MaxFolderFiles files is never mounted at all: Obsidian
+    ///   caches everything it indexes in %APPDATA%\obsidian\IndexedDB, outside the
+    ///   vault, and a mount that big poisons that cache - once the mount is gone
+    ///   the cache no longer matches disk and Obsidian deadlocks on "loading"
+    ///   whenever that vault is opened (observed in the wild, zero CPU/zero IO).
     ///
     /// Why an exe instead of powershell/wscript:
     ///   Compiled with /target:winexe (GUI subsystem), so it never flashes a
@@ -89,6 +94,21 @@ namespace OpenInObsidian
         /// lower it via reflection.
         /// </summary>
         private static int MaxMountedLinks = 10;
+
+        /// <summary>
+        /// Cap on how many files a folder may hold and still be mounted into the
+        /// bridge vault. Obsidian indexes every file of every mount into a cache
+        /// it keeps *outside* the vault (%APPDATA%\obsidian\IndexedDB). Mounting a
+        /// folder with hundreds of thousands of files (node_modules and friends)
+        /// balloons that cache, and once the mount later disappears - evicted by
+        /// the LRU below, or the folder deleted - the cache no longer matches
+        /// disk and Obsidian can hang on "loading" forever for that vault, with
+        /// no way for the user to tell why. Refusing the mount up front costs
+        /// milliseconds (CountFilesCapped stops at the cap) and keeps the bridge
+        /// vault in a state Obsidian can always load.
+        /// A static field rather than a const so the test driver can lower it.
+        /// </summary>
+        private static int MaxFolderFiles = 5000;
 
         /// <summary>MAX_PATH budget; longer bridged paths would fail to open.</summary>
         private const int MaxPathLength = 259;
@@ -308,7 +328,8 @@ namespace OpenInObsidian
         /// path. Returns false - so the caller falls back to an ordinary editor -
         /// whenever anything is off: bridge vault missing or not registered with
         /// Obsidian, folder is a drive root, folder overlaps the bridge vault
-        /// itself, path too long, or the mount failed. Never throws.
+        /// itself, folder holds too many files, path too long, or the mount failed.
+        /// Never throws.
         /// </summary>
         private static bool TryOpenInBridgeVault(string path, List<string> vaults)
         {
@@ -375,6 +396,20 @@ namespace OpenInObsidian
                 List<string> names;
                 List<string> targets;
                 ReadBridgeLinks(bridge, out names, out targets);
+
+                // Refuse to mount a folder that holds a huge file tree (see
+                // MaxFolderFiles): Obsidian would index all of it into its
+                // out-of-vault cache, and losing that mount later can leave the
+                // whole bridge vault stuck on "loading". Folders already covered
+                // by an existing link are exempt - that cost was paid on an
+                // earlier run and the file is reachable right now, so refusing
+                // would only break a mount that already works.
+                if (FindCoveringLink(bridge, dir, names, targets) == null
+                    && CountFilesCapped(dir, MaxFolderFiles) >= MaxFolderFiles)
+                {
+                    return Fallback("folder holds " + MaxFolderFiles
+                        + "+ files, too large to mount into the bridge vault: " + dir);
+                }
 
                 bool mountedNow;
                 string linkPath = SelectLink(bridge, dir, names, targets, out mountedNow);
@@ -544,6 +579,72 @@ namespace OpenInObsidian
         }
 
         /// <summary>
+        /// The bridge-vault path that already exposes <paramref name="dir"/>: the
+        /// link whose target is that very folder, or the link whose target is an
+        /// ancestor of it (with the rest of the path appended). Null when no
+        /// existing link covers the folder, i.e. a new junction would be needed.
+        /// </summary>
+        private static string FindCoveringLink(string bridge, string dir,
+            List<string> names, List<string> targets)
+        {
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (dir.Equals(targets[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    return Path.Combine(bridge, names[i]);
+                }
+                if (dir.StartsWith(targets[i] + "\\", StringComparison.OrdinalIgnoreCase))
+                {
+                    return Path.Combine(bridge, names[i], dir.Substring(targets[i].Length + 1));
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Counts the files under <paramref name="dir"/>, stopping the moment the
+        /// count reaches <paramref name="cap"/> - so rejecting a folder that holds
+        /// hundreds of thousands of files costs about as much as rejecting a small
+        /// one. Junctions and symlinks inside are never followed: they can point
+        /// anywhere (including back up the tree), and staying cheap is the whole
+        /// point. Inaccessible subfolders are skipped, never fatal. Never throws.
+        /// </summary>
+        private static int CountFilesCapped(string dir, int cap)
+        {
+            if (cap <= 0) { return 0; }
+            int files = 0;
+            var pending = new Stack<string>();
+            pending.Push(dir);
+            while (pending.Count > 0 && files < cap)
+            {
+                string current = pending.Pop();
+                try
+                {
+                    foreach (string file in Directory.EnumerateFiles(current))
+                    {
+                        files++;
+                        if (files >= cap) { return files; }
+                    }
+                }
+                catch { }
+                try
+                {
+                    foreach (string sub in Directory.EnumerateDirectories(current))
+                    {
+                        try
+                        {
+                            if ((File.GetAttributes(sub) & FileAttributes.ReparsePoint) != 0) { continue; }
+                        }
+                        catch { continue; }
+                        pending.Push(sub);
+                    }
+                }
+                catch { }
+            }
+            return files;
+        }
+
+        /// <summary>
         /// Picks the bridge-vault path that should hold the file, creating a
         /// junction when needed. An existing link is reused whenever the folder is
         /// the link's target or sits underneath it.
@@ -557,17 +658,8 @@ namespace OpenInObsidian
         {
             created = false;
 
-            for (int i = 0; i < names.Count; i++)
-            {
-                if (dir.Equals(targets[i], StringComparison.OrdinalIgnoreCase))
-                {
-                    return Path.Combine(bridge, names[i]);
-                }
-                if (dir.StartsWith(targets[i] + "\\", StringComparison.OrdinalIgnoreCase))
-                {
-                    return Path.Combine(bridge, names[i], dir.Substring(targets[i].Length + 1));
-                }
-            }
+            string existing = FindCoveringLink(bridge, dir, names, targets);
+            if (existing != null) { return existing; }
 
             for (int i = 0; i < names.Count; i++)
             {
